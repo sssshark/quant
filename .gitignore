@@ -1,0 +1,13 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Claude 本地配置（含机器相关的本地设置，不入仓库）
+.claude/settings.local.json
+
+# 运行时状态（实盘/模拟盘账户与调仓记录，随运行变化，不入仓库）
+paper_account.json
+last_rebalance.txt
+
+# 回测产出的图（可由 etf_momentum.py 重新生成）
+ETF动量轮动_回测结果.png
