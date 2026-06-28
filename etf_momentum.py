@@ -17,7 +17,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
-                           VOL_TARGET, TREND_MA, COMMISSION, SLIPPAGE, decide_targets)
+                           VOL_TARGET, TREND_MA, SKIP_RECENT, RISK_ADJ,
+                           COMMISSION, SLIPPAGE, decide_targets)
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
 
@@ -42,9 +43,11 @@ def load_real():
 
 
 # ---------------- 回测引擎（调用核心大脑） ----------------
-def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_ma=None):
+def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_ma=None,
+             skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
-    trend_ma: 大盘趋势过滤均线天数（None=关闭），用于对比加/不加趋势择时的效果。"""
+    trend_ma:    大盘趋势过滤均线天数（None=关闭），用于对比加/不加趋势择时的效果。
+    skip_recent: 跳过最近 N 日再算动量（21≈1个月）；risk_adj: 是否用风险调整动量。两者用于 A/B 测试。"""
     rets = px.pct_change().fillna(0.0)                      # 每只标的的每日收益率矩阵
 
     # 1) 找出每个月最后一个交易日作为调仓日；并跳过历史不足 MAX_LOOKBACK 的初期
@@ -63,7 +66,8 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
             recent = {c: px[c].loc[:d].dropna().tolist() for c in POOL}
             target, picks = decide_targets(recent, lookbacks=lookbacks,
                                            top_n=top_n, vol_target=vol_target,
-                                           trend_ma=trend_ma)
+                                           trend_ma=trend_ma, skip_recent=skip_recent,
+                                           risk_adj=risk_adj)
             if target:
                 cur = pd.Series(0.0, index=px.columns)
                 for code, w in target.items():

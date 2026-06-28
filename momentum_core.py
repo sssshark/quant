@@ -29,7 +29,10 @@ DEFENSE = ("511010", "国债ETF")        # 防守资产
 
 # ---------------- 策略参数 ----------------
 LOOKBACKS = (21, 63, 126)              # 混合动量回看窗口（约 1/3/6 个月）
-MAX_LOOKBACK = max(LOOKBACKS)          # 需要的最少历史长度
+SKIP_RECENT = 0                        # 算动量时跳过最近 N 个交易日（21≈1个月）；避开"短期反转"噪声，0=不跳
+RISK_ADJ = True                        # 风险调整动量：动量÷该标的波动，偏好"平滑上涨"而非"剧烈拉升"
+                                       #   （回测验证：Top3 下夏普 1.19→1.23、回撤不变；改 False 可回退）
+MAX_LOOKBACK = max(LOOKBACKS)          # 需要的最少历史长度（注意：跳过期 skip 会额外吃历史，见 blended_momentum）
 TOP_N = 3                              # 持有动量最高的前 N 只（等权）
 CASH_BUFFER = 0.99                     # 目标仓位上限（留 1% 现金，吸收手续费/滑点）
 VOL_TARGET = 0.15                      # 年化目标波动；组合近期波动超此值就降风险仓（None=关闭）
@@ -54,25 +57,58 @@ def _is_num(x):
     return x is not None and not (isinstance(x, float) and math.isnan(x))
 
 
-def blended_momentum(arr, lookbacks=LOOKBACKS):
+def _asset_daily_vol(arr, end_idx, window):
+    """
+    单只标的最近 window 个日收益的标准差（不年化，仅用于风险调整动量的分母）。
+    end_idx 是"截止位置"的下标（含），向前取 window 个日收益。数据不足返回 None。
+    """
+    seg = arr[end_idx - window: end_idx + 1]      # window+1 个价 → window 个日收益
+    if len(seg) < window + 1:
+        return None
+    rets = []
+    for i in range(1, len(seg)):
+        a, b = seg[i - 1], seg[i]
+        if _is_num(a) and _is_num(b) and a:
+            rets.append(b / a - 1.0)
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((x - mean) ** 2 for x in rets) / len(rets)
+    return var ** 0.5
+
+
+def blended_momentum(arr, lookbacks=LOOKBACKS, skip=SKIP_RECENT, risk_adj=RISK_ADJ):
     """
     多周期混合动量：各回看窗口涨幅的平均。历史不足任一窗口则返回 None（该标的本期不参与）。
     arr 是某只标的的收盘价序列（升序），arr[-1] 为当前价。
+
+    skip:     跳过最近 skip 个交易日再算动量。学术界的"12-1 动量"经验——最近一个月常有
+              短期反转，跳过它能让趋势信号更干净。end 改为 arr[-1-skip]，各窗口都往前挪 skip。
+    risk_adj: True 时把混合动量除以该标的近期日波动，得到"风险调整动量"，
+              倾向于选"涨得稳"的而非"涨得猛但很颠"的标的。
     """
     if not arr:                                   # 空序列（如新上市标的早期无数据）
         return None
-    now = arr[-1]
-    if not _is_num(now):
+    end = len(arr) - 1 - skip                     # 计算动量的"终点"下标（跳过最近 skip 日）
+    if end < 0 or not _is_num(arr[end]):
         return None
+    now = arr[end]
     vals = []
     for lb in lookbacks:                          # 例如 lb=21/63/126
-        if len(arr) <= lb:                        # 历史长度不够这个窗口 → 整体放弃
+        past_idx = end - lb                       # 终点再往前 lb 天
+        if past_idx < 0:                          # 历史长度不够这个窗口（含 skip）→ 整体放弃
             return None
-        past = arr[-1 - lb]                       # lb 个交易日前的价格
+        past = arr[past_idx]
         if not _is_num(past) or past == 0:
             return None
         vals.append(now / past - 1.0)             # 这个窗口的涨幅
-    return sum(vals) / len(vals)                  # 多窗口取平均 = 混合动量分
+    mom = sum(vals) / len(vals)                   # 多窗口取平均 = 混合动量分
+    if risk_adj:                                  # 风险调整：动量 ÷ 波动（用最长窗口的日波动做分母）
+        vol = _asset_daily_vol(arr, end, max(lookbacks))
+        if not vol:
+            return None
+        mom = mom / vol
+    return mom
 
 
 def _realized_vol(recent_closes, eq_codes, window):
@@ -117,7 +153,7 @@ def _below_trend(recent_closes, code, ma_window):
 def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    cash_buffer=CASH_BUFFER, vol_target=VOL_TARGET,
                    vol_window=VOL_WINDOW, trend_ma=None, trend_code=TREND_CODE,
-                   trend_cut=TREND_CUT):
+                   trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -127,6 +163,8 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                      按比例缩小股票仓位、把缩出来的部分挪到防守资产，以压低回撤。
       trend_ma:      大盘趋势过滤的均线天数（None 关闭）。风向标(trend_code，默认沪深300)
                      价跌破该均线视为大盘下行，按 trend_cut 缩小股票仓、其余挪防守资产。
+      skip_recent:   算动量时跳过最近 N 个交易日（21≈跳过1个月，避开短期反转），透传给 blended_momentum。
+      risk_adj:      是否用风险调整动量（动量÷波动），透传给 blended_momentum。
     输出:
       target: {code: 目标权重}，键可能含防守资产 DEFENSE[0]，权重和 ≈ cash_buffer。
       picks:  [中文名, ...]  本次实际持有的标的（用于日志）。
@@ -139,7 +177,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         arr = recent_closes.get(code)
         if arr is None:
             continue
-        m = blended_momentum(arr, lookbacks)
+        m = blended_momentum(arr, lookbacks, skip=skip_recent, risk_adj=risk_adj)
         if m is not None:                          # None = 历史不足，跳过
             moms.append((m, code))
 
