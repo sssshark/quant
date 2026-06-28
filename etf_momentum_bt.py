@@ -21,6 +21,9 @@ from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK,
                            COMMISSION, SLIPPAGE, BENCH, TREND_MA, decide_targets)
 
 START_CASH = 1_000_000
+# 喂给决策大脑的历史长度要同时够"动量回看"和"大盘趋势均线"两者，取较大值。
+# 否则只喂 MAX_LOOKBACK(126) 根，趋势过滤(需 TREND_MA=200 根)会因数据不足静默失效。
+HISTORY = max(MAX_LOOKBACK, TREND_MA)
 
 # ---------------- 数据获取（返回 OHLCV，按各自上市日） ----------------
 def load_real():
@@ -44,11 +47,16 @@ def load_real():
 
 # ---------------- 策略 ----------------
 class MomentumRotation(bt.Strategy):
+    # rebal_days：预计算好的"每月最后一个交易日"集合（date 对象）。只在这些日子调仓，
+    # 与向量化版 etf_momentum.py 的月末调仓口径对齐。传 None 则退回"每月第一个交易日"。
+    params = (("rebal_days", None),)
+
     def __init__(self):
         # self.datas 是 backtrader 注入的所有数据源列表；d._name 是添加时设的代码。
         # 这里挑出“股票 ETF”那几只（排除防守国债），动量排序只在它们之间做。
         self.stock_feeds = [d for d in self.datas if d._name in POOL]
-        self._last_month = None      # 记录上次调仓的月份，用于“每月只调一次”判断
+        self.rebal_set = set(self.p.rebal_days) if self.p.rebal_days else None
+        self._last_month = None      # 仅在没传 rebal_days 时用（退回月初调仓的兜底逻辑）
         self.holdings_log = []       # 记录每次调仓持有了什么（用于打印/核对）
 
     def prenext(self):
@@ -61,19 +69,27 @@ class MomentumRotation(bt.Strategy):
         """为核心大脑准备 {code: 收盘价升序序列}，只放数据够长的标的。"""
         out = {}
         for d in self.stock_feeds:
-            if len(d) > MAX_LOOKBACK:        # 已有的历史 bar 数够长才参与
+            if len(d) > MAX_LOOKBACK:        # 已有的历史 bar 数够长才参与动量排序
+                # 想喂 HISTORY 根（够趋势均线用），但早期 bar 还没攒够，就有多少给多少，
+                # 用 min 防止 d.close[-k] 越界（k 最多到 len(d)-1，即最早一根）。
+                k = min(len(d) - 1, HISTORY)
                 # d.close[0] 是当前收盘，d.close[-1] 是昨天……负得越多越早。
-                # range(MAX_LOOKBACK, -1, -1) 生成 126,125,...,1,0，于是按时间升序取价。
-                out[d._name] = [d.close[-k] for k in range(MAX_LOOKBACK, -1, -1)]
+                # range(k, -1, -1) 生成 k,k-1,...,1,0，于是按时间升序取价。
+                out[d._name] = [d.close[-i] for i in range(k, -1, -1)]
         return out
 
     def next(self):
         # next() 每根 bar（每个交易日）被调用一次；datetime.date(0) 是“当前这根”的日期。
         dt = self.datas[0].datetime.date(0)
-        # 月份和上次相同 → 本月已调过，直接返回（实现“每月第一个交易日才调仓”）
-        if dt.month == self._last_month:
-            return
-        self._last_month = dt.month
+        if self.rebal_set is not None:
+            # 月末调仓口径：只在"每月最后一个交易日"动手，其余日子直接返回。
+            if dt not in self.rebal_set:
+                return
+        else:
+            # 兜底：没预算调仓日时，退回"每月第一个交易日"（月份变了才调）。
+            if dt.month == self._last_month:
+                return
+            self._last_month = dt.month
 
         # === 选股大脑：与实盘共用同一个 decide_targets ===
         # 显式开启大盘趋势过滤（trend_ma），与向量化回测/实盘保持一致；波动率目标默认已开。
@@ -104,10 +120,18 @@ def add_feeds(cerebro, data: dict):
                                    close="close", volume="volume", openinterest=-1)
         cerebro.adddata(feed, name=code)       # name 即上面策略里用的 d._name
 
+def month_end_trading_days(data):
+    """从行情里算出"每月最后一个交易日"集合（用基准的交易日历，纯日历、无前视）。"""
+    idx = data[BENCH].index                          # 基准 510300 历史最长，用它当交易日历
+    last_per_month = idx.to_series().resample("ME").last()   # 每月最后一个交易日
+    return set(last_per_month.dropna().dt.date)       # 转成 date 集合，供策略按日比对
+
+
 def run_strategy(data):
     cerebro = bt.Cerebro()                      # Cerebro 是 backtrader 的总引擎/大脑
     add_feeds(cerebro, data)                    # 喂入各 ETF 行情
-    cerebro.addstrategy(MomentumRotation)       # 注册策略类（引擎会自动实例化并逐日调 next）
+    # 传入月末调仓日，与向量化版口径一致（每月最后一个交易日决策）
+    cerebro.addstrategy(MomentumRotation, rebal_days=month_end_trading_days(data))
     cerebro.broker.setcash(START_CASH)          # 设初始资金
     cerebro.broker.setcommission(commission=COMMISSION)   # 设手续费率
     cerebro.broker.set_slippage_perc(perc=SLIPPAGE)       # 设滑点率

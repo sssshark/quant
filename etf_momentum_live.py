@@ -34,6 +34,7 @@ DRY_RUN = True                                   # 仅对 qmt 生效：True=只�
 LOT = 100                                        # ETF 最小交易单位（股）
 REBALANCE_BAND = 0.05                             # 再平衡静默区：偏离<5%总资产的小漂移不调仓
 ONCE_PER_MONTH = True                             # True=每月只调一次（适合每日定时触发）
+MONTH_END_ONLY = True                             # True=只在"本月最后一个交易日"调仓，与回测月末口径对齐（force 可绕过）
 # os.path.dirname(__file__) 是“本脚本所在目录”，拼上文件名 → 标记文件放在脚本旁边，
 # 这样不管从哪个目录运行脚本，都能找到同一个文件。
 MONTH_MARKER = os.path.join(os.path.dirname(__file__), "last_rebalance.txt")
@@ -190,8 +191,31 @@ def mark_done_this_month():
         f.write(_this_month())
 
 
+def is_month_end_trading_day():
+    """
+    今天是否为本月最后一个交易日（用 akshare 上交所交易日历判断）。
+    与回测的"月末调仓"口径对齐：只有当天是本月最后一个交易日时才真正调仓。
+    取不到日历时保守返回 True（不拦截，避免因数据源故障错过调仓）。
+    """
+    try:
+        import akshare as ak
+        import pandas as pd
+        cal = pd.to_datetime(ak.tool_trade_date_hist_sina()["trade_date"])  # 全年交易日（含未来）
+        today = dt.date.today()
+        this_month = cal[(cal.dt.year == today.year) & (cal.dt.month == today.month)]
+        if this_month.empty:
+            return True
+        return today == this_month.max().date()    # 今天 == 本月最后一个交易日？
+    except Exception as e:
+        print("[warn] 取交易日历失败，跳过月末校验：", e)
+        return True
+
+
 def main():
     force = "force" in sys.argv[1:]               # python etf_momentum_live.py force 可强制重跑
+    if MONTH_END_ONLY and not is_month_end_trading_day() and not force:
+        print(f"[{BROKER}] 今天不是本月最后一个交易日，按月末调仓口径跳过。加 force 可强制运行。")
+        return
     if already_done_this_month() and not force:
         print(f"[{BROKER}] 本月（{_this_month()}）已调仓，跳过。加 force 参数可强制重跑。")
         return
