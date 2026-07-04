@@ -31,10 +31,11 @@ def load_real():
     import akshare as ak
     codes = list(POOL.keys()) + [DEFENSE[0]]   # 池中所有股票 ETF + 防守资产
     out = {}                                    # {代码: OHLCV 的 DataFrame}
+    end_date = pd.Timestamp.today().strftime("%Y%m%d")   # 动态截止日：跑到哪天拉到哪天，不再锁死 2025 年底
     for c in codes:
         # 拉日线行情；adjust="qfq" 表示前复权（消除分红/拆分造成的价格跳变）
         raw = ak.fund_etf_hist_em(symbol=c, period="daily",
-                                  start_date="20140101", end_date="20251231", adjust="qfq")
+                                  start_date="20140101", end_date=end_date, adjust="qfq")
         raw["日期"] = pd.to_datetime(raw["日期"])      # 字符串日期转成时间戳
         raw = raw.set_index("日期").sort_index()       # 用日期当索引并按时间排序
         # 把 akshare 的中文列名映射成 backtrader 认的英文 OHLCV 列名
