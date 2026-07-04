@@ -53,6 +53,13 @@ TREND_CUT = 0.5                        # 下行时股票仓位"保留比例"（0
 # 仍向后兼容旧名字（个别脚本可能 import LOOKBACK）
 LOOKBACK = MAX_LOOKBACK
 
+# ---- 持仓加权方式（改进项 C1：反向波动加权）----
+# equal  : 每只入选标的等权（原行为，默认，向后兼容，回测/实盘默认不变）
+# inv_vol: 权重 ∝ 1/σ_i 后归一化——波动大的标的（创业板/中证1000）少配、波动小的多配，
+#          降低高波动标的对组合风险的过度主导。σ_i 取该标的近 INV_VOL_WINDOW 日日波动。
+WEIGHTING = "equal"
+INV_VOL_WINDOW = 63                       # 反向波动加权估计日波动的回看窗口（约3个月，比 20 日稳）
+
 
 def _is_num(x):
     """是否为有效数字（排除 None 和 NaN）——价格序列里可能混入缺失值。"""
@@ -155,7 +162,8 @@ def _below_trend(recent_closes, code, ma_window):
 def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    cash_buffer=CASH_BUFFER, vol_target=VOL_TARGET,
                    vol_window=VOL_WINDOW, trend_ma=None, trend_code=TREND_CODE,
-                   trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ):
+                   trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ,
+                   weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -186,18 +194,33 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
     if len(moms) < top_n:
         return {}, []          # 可选标的不足（如回测初期），空仓/保持现状
 
-    # === 第二步：按动量从高到低取前 top_n，分配等权权重 ===
+    # === 第二步：按动量从高到低取前 top_n，分配权重（等权 / 反向波动） ===
     moms.sort(key=lambda x: x[0], reverse=True)
     picks_raw = moms[:top_n]
 
     target, picks = {}, []
     dcode = DEFENSE[0]
-    w = cash_buffer / top_n                         # 每个仓位的目标权重
+    # 入选标的的目标权重 weights[code]：
+    #   equal  : 每只 cash_buffer/top_n（原行为，向后兼容）
+    #   inv_vol: 权重 ∝ 1/σ_i 后归一化到 cash_buffer（改进项 C1）。任一只波动数据不足
+    #            → 用 1 顶替（与其它同尺度归一化，退化为等权，不报错）。
+    if weighting == "inv_vol":
+        raw = {}
+        for _m, code in picks_raw:
+            arr = recent_closes.get(code)
+            end = len(arr) - 1 if arr else -1
+            v = _asset_daily_vol(arr, end, inv_vol_window) if end >= 0 else None
+            raw[code] = (1.0 / v) if (v and v > 0) else 1.0      # 无波动数据 → 等权兜底
+        s = sum(raw.values())
+        weights = {c: cash_buffer * raw[c] / s for c in raw} if s > 0 else {}
+    else:                                                        # equal
+        weights = {c: cash_buffer / top_n for _m, c in picks_raw}
     for mom, code in picks_raw:
-        if mom > 0:                                 # 绝对动量为正 → 真持有该 ETF
+        w = weights.get(code, cash_buffer / top_n)              # 兜底等权
+        if mom > 0:                                             # 绝对动量为正 → 真持有该 ETF
             target[code] = target.get(code, 0.0) + w
             picks.append(POOL[code])
-        else:                                       # 动量≤0 → 这个仓位切防守资产（国债）
+        else:                                                   # 动量≤0 → 这一份切防守资产（国债）
             target[dcode] = target.get(dcode, 0.0) + w
             picks.append(DEFENSE[1])
 

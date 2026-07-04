@@ -27,15 +27,28 @@ HISTORY = max(MAX_LOOKBACK, TREND_MA)
 
 # ---------------- 数据获取（返回 OHLCV，按各自上市日） ----------------
 def load_real():
-    """用 akshare 拉真实日线（前复权 OHLCV），每只 ETF 用自身上市后的区间。"""
+    """用 akshare 拉真实日线（前复权 OHLCV），每只 ETF 用自身上市后的区间。
+    改进项 E2：带重试 + 指数退避，应对东财接口限频（详见 etf_momentum.load_real 注释）。"""
     import akshare as ak
+    import time
     codes = list(POOL.keys()) + [DEFENSE[0]]   # 池中所有股票 ETF + 防守资产
     out = {}                                    # {代码: OHLCV 的 DataFrame}
     end_date = pd.Timestamp.today().strftime("%Y%m%d")   # 动态截止日：跑到哪天拉到哪天，不再锁死 2025 年底
     for c in codes:
-        # 拉日线行情；adjust="qfq" 表示前复权（消除分红/拆分造成的价格跳变）
-        raw = ak.fund_etf_hist_em(symbol=c, period="daily",
-                                  start_date="20140101", end_date=end_date, adjust="qfq")
+        raw = None
+        for attempt in range(4):                          # 重试 + 退避，应对东财限频
+            try:
+                # 拉日线行情；adjust="qfq" 表示前复权（消除分红/拆分造成的价格跳变）
+                raw = ak.fund_etf_hist_em(symbol=c, period="daily",
+                                          start_date="20140101", end_date=end_date, adjust="qfq")
+                if len(raw):
+                    break
+                raw = None
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"{c} 拉取失败（东财限频？）: {e}") from e
+            time.sleep(5 * (attempt + 1))
+        time.sleep(0.3)
         raw["日期"] = pd.to_datetime(raw["日期"])      # 字符串日期转成时间戳
         raw = raw.set_index("日期").sort_index()       # 用日期当索引并按时间排序
         # 把 akshare 的中文列名映射成 backtrader 认的英文 OHLCV 列名

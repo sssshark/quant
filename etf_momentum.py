@@ -22,20 +22,38 @@ import matplotlib.pyplot as plt
 
 from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
                            VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, SKIP_RECENT,
-                           RISK_ADJ, COMMISSION, SLIPPAGE, decide_targets)
+                           RISK_ADJ, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
+                           decide_targets)
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
 
 
 # ---------------- 数据 ----------------
 def load_real():
-    """akshare 拉真实日线（前复权收盘价），各 ETF 按自身上市日，起点锚定基准+防守。"""
+    """akshare 拉真实日线（前复权收盘价），各 ETF 按自身上市日，起点锚定基准+防守。
+
+    改进项 E2：每只 ETF 带重试 + 指数退避，应对东财接口临时限频。注意 akshare 内 ETF
+    复权数据仅东财(fund_etf_hist_em)一家可靠——新浪源(fund_etf_hist_sina)不复权、
+    baostock 与股票接口均不支持 ETF，故无等价复权备源；长期根治需引入 tushare 等付费源。"""
     import akshare as ak
+    import time
     end_date = pd.Timestamp.today().strftime("%Y%m%d")   # 动态截止日：跑到哪天拉到哪天，不再锁死 2025 年底
     series = {}
     for c in ALL_CODES:
-        df = ak.fund_etf_hist_em(symbol=c, period="daily",
-                                 start_date="20140101", end_date=end_date, adjust="qfq")
+        df = None
+        for attempt in range(4):                          # 最多重试 4 次，指数退避
+            try:
+                df = ak.fund_etf_hist_em(symbol=c, period="daily",
+                                         start_date="20140101", end_date=end_date, adjust="qfq")
+                if len(df):
+                    break
+                df = None                                  # 空表视为失败
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(
+                        f"{c} 拉取失败（东财接口可能限频，请稍后重试或更换网络）: {e}") from e
+            time.sleep(5 * (attempt + 1))                  # 失败退避 5/10/15/20s
+        time.sleep(0.3)                                    # 成功也小间隔，降低触发限频概率
         df["日期"] = pd.to_datetime(df["日期"])
         series[c] = df.set_index("日期")["收盘"].rename(c)
     # 各 ETF 上市日不同，按日期外连接成一张宽表（缺失处为 NaN）
@@ -50,7 +68,7 @@ def load_real():
 # ---------------- 回测引擎（调用核心大脑） ----------------
 def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_ma=None,
              trend_cut=TREND_CUT, vol_window=VOL_WINDOW, skip_recent=SKIP_RECENT,
-             risk_adj=RISK_ADJ):
+             risk_adj=RISK_ADJ, weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     trend_ma:    大盘趋势过滤均线天数（None=关闭），用于对比加/不加趋势择时的效果。
     trend_cut:   趋势下行时股票仓的"保留比例"（透传给 decide_targets，供 robust 扫描）。
@@ -82,7 +100,8 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            top_n=top_n, vol_target=vol_target,
                                            vol_window=vol_window, trend_ma=trend_ma,
                                            trend_cut=trend_cut, skip_recent=skip_recent,
-                                           risk_adj=risk_adj)
+                                           risk_adj=risk_adj, weighting=weighting,
+                                           inv_vol_window=inv_vol_window)
             if target:
                 cur = pd.Series(0.0, index=px.columns)
                 for code, w in target.items():
@@ -122,6 +141,17 @@ def perf(nav, daily):
     sharpe = (daily.mean() * 252) / (daily.std() * np.sqrt(252) + 1e-12)  # 夏普（无风险利率按0）
     mdd = ((nav / nav.cummax()) - 1).min()             # 最大回撤 = 距历史最高点的最大跌幅
     return dict(总收益=nav.iloc[-1]-1, 年化=cagr, 波动=vol, 夏普=sharpe, 回撤=mdd, 年数=years)
+
+
+def rolling_metrics(daily, window=252):
+    """滚动 window 日（默认1年）的年化夏普/波动 + 逐日回撤（水下曲线）序列。
+    全期单个夏普会掩盖“某段靠运气”，看滚动序列才能判断策略是否随时间稳定（改进项 F2）。"""
+    roll_sharpe = daily.rolling(window).apply(
+        lambda x: (x.mean() * 252) / (x.std() * np.sqrt(252) + 1e-12), raw=True)
+    roll_vol = daily.rolling(window).std() * np.sqrt(252)
+    nav = (1 + daily).cumprod()
+    drawdown = nav / nav.cummax() - 1                         # 水下曲线：距历史最高点的跌幅
+    return roll_sharpe, roll_vol, drawdown
 
 
 def _print_table(rows):
@@ -434,45 +464,62 @@ def main():
         run_universe(px)
         return
 
-    # 改进版（无回撤控制） vs +波动率目标 vs +波动率目标+大盘趋势过滤 vs 基准
+    # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准
     nav_base, ret_base, _, _ = backtest(px, vol_target=None)
-    nav_vt, ret_vt, n_vt, log = backtest(px, vol_target=VOL_TARGET)
-    nav_tr, ret_tr, _, log_tr = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)
+    nav_vt, ret_vt, n_vt, _ = backtest(px, vol_target=VOL_TARGET)
+    nav_tr, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)              # 等权（默认）
+    nav_iv, ret_iv, _, log = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA,
+                                      weighting="inv_vol")                                      # C1 反向波动
     bn = bench_nav(px)
 
-    p_base, p_vt, p_tr = perf(nav_base, ret_base), perf(nav_vt, ret_vt), perf(nav_tr, ret_tr)
+    p_base, p_vt = perf(nav_base, ret_base), perf(nav_vt, ret_vt)
+    p_tr, p_iv = perf(nav_tr, ret_tr), perf(nav_iv, ret_iv)
     pb = perf(bn, bn.pct_change().fillna(0))
 
-    print(f"回测区间: {nav_vt.index[0].date()} ~ {nav_vt.index[-1].date()}  "
-          f"共{p_vt['年数']:.1f}年  调仓{n_vt}次  （真实数据）\n")
+    print(f"回测区间: {nav_tr.index[0].date()} ~ {nav_tr.index[-1].date()}  "
+          f"共{p_tr['年数']:.1f}年  调仓{n_vt}次  （真实数据）\n")
     _print_table([
         ("改进版(无回撤控制)", p_base),
         (f"改进版+波动目标{int(VOL_TARGET*100)}%", p_vt),
-        (f"+大盘趋势过滤{TREND_MA}日", p_tr),
+        (f"+大盘趋势过滤{TREND_MA}日(等权)", p_tr),
+        (f"+大盘趋势过滤(反向波动C1)", p_iv),
         ("买入持有沪深300", pb),
     ])
+    print(f"\n[C1 反向波动 vs 等权] 夏普 {p_tr['夏普']:.2f}→{p_iv['夏普']:.2f} "
+          f"({p_iv['夏普']-p_tr['夏普']:+.2f})  年化 {p_tr['年化']*100:.1f}%→{p_iv['年化']*100:.1f}% "
+          f"({(p_iv['年化']-p_tr['年化'])*100:+.1f}pp)  回撤 {p_tr['回撤']*100:.1f}%→{p_iv['回撤']*100:.1f}%")
     if log:
-        print(f"\n最近一次调仓 {log[-1][0]}: {log[-1][1]}")
+        print(f"最近一次调仓 {log[-1][0]}: {log[-1][1]}")
 
-    # 画图：趋势过滤版 vs 波动目标版 vs 无控制版 vs 基准
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    ax.plot(nav_tr.index, nav_tr.values, label=f"+ Trend Filter MA{TREND_MA}", lw=2.0, color="#2e7d32")
-    ax.plot(nav_vt.index, nav_vt.values, label=f"Improved + VolTarget {int(VOL_TARGET*100)}% (Top3)", lw=1.6, color="#1f4e79")
-    ax.plot(nav_base.index, nav_base.values, label="Improved, no risk control", lw=1.2, color="#7f7f7f", alpha=0.8)
-    ax.plot(bn.index, bn.values, label="Buy & Hold CSI300", lw=1.3, color="#c0504d", alpha=0.85)
-    ax.set_yscale("log")
-    ax.set_title("A-share ETF Momentum Rotation [REAL]")
-    ax.set_ylabel("Net Value (log, start=1.0)")
-    ax.legend(loc="upper left"); ax.grid(alpha=0.3)
-    txt = (f"TrendFilt CAGR {p_tr['年化']*100:.1f}%  MaxDD {p_tr['回撤']*100:.1f}%  Sharpe {p_tr['夏普']:.2f}\n"
-           f"VolTarget CAGR {p_vt['年化']*100:.1f}%  MaxDD {p_vt['回撤']*100:.1f}%  Sharpe {p_vt['夏普']:.2f}\n"
-           f"CSI300    CAGR {pb['年化']*100:.1f}%  MaxDD {pb['回撤']*100:.1f}%  Sharpe {pb['夏普']:.2f}")
-    ax.text(0.99, 0.02, txt, transform=ax.transAxes, va="bottom", ha="right",
-            fontsize=9, family="monospace", bbox=dict(boxstyle="round", fc="#f5f5f5", ec="#ccc"))
+    # 画图：净值 / 水下曲线 / 滚动夏普 三子图（F2 滚动指标）
+    rs_tr, _, dd_tr = rolling_metrics(ret_tr)
+    rs_iv, _, dd_iv = rolling_metrics(ret_iv)
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1, 1]})
+    axes[0].plot(nav_tr.index, nav_tr.values, label="等权 + TrendFilt", lw=1.8, color="#1f4e79")
+    axes[0].plot(nav_iv.index, nav_iv.values, label="反向波动 + TrendFilt (C1)", lw=1.8, color="#2e7d32")
+    axes[0].plot(bn.index, bn.values, label="Buy & Hold CSI300", lw=1.1, color="#c0504d", alpha=0.8)
+    axes[0].set_yscale("log"); axes[0].set_ylabel("Net Value (log)")
+    axes[0].legend(loc="upper left"); axes[0].grid(alpha=0.3)
+    axes[0].set_title("A-share ETF Momentum Rotation [REAL] — C1 反向波动加权 vs 等权")
+    axes[1].fill_between(dd_tr.index, dd_tr.values * 100, 0, color="#1f4e79", alpha=0.25, label="等权")
+    axes[1].plot(dd_iv.index, dd_iv.values * 100, color="#2e7d32", lw=1.0, label="反向波动")
+    axes[1].set_ylabel("Drawdown %"); axes[1].legend(loc="lower left"); axes[1].grid(alpha=0.3)
+    axes[2].plot(rs_tr.index, rs_tr.values, color="#1f4e79", lw=1.0, label="等权")
+    axes[2].plot(rs_iv.index, rs_iv.values, color="#2e7d32", lw=1.0, label="反向波动")
+    axes[2].axhline(0, color="k", lw=0.5)
+    axes[2].set_ylabel("Rolling Sharpe (1y)"); axes[2].legend(loc="upper left"); axes[2].grid(alpha=0.3)
     fig.tight_layout()
     out = "ETF动量轮动_回测结果.png"
     fig.savefig(out, dpi=130)
     print("\n图已保存:", out)
+
+    print("\n[F2 滚动指标(1年窗口)摘要]")
+    for name, rs in (("等权", rs_tr), ("反向波动", rs_iv)):
+        rs = rs.dropna()
+        if len(rs):
+            print(f"  {name}: 滚动夏普 均值{rs.mean():.2f} / 最差{rs.min():.2f} / "
+                  f"占比>0 {(rs > 0).mean() * 100:.0f}%")
 
 
 if __name__ == "__main__":
