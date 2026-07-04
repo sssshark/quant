@@ -44,7 +44,7 @@
 
 ## A. 信号与因子层 `momentum_core.py`
 
-- [ ] **[高] A1** 动量崩溃保护 — 位置:`全局缺失`(无 regime 识别)— Daniel-Moskowitz(2013)《Momentum Crashes》:市场急速反转(2009 式)时动量会崩,需 regime 识别 + 动态保护
+- [ ] **[高] A1** 动量崩溃保护 — 位置:`decide_targets` 第五步 — **代码完成(默认关)**:市场反弹保护方案,大盘近 21 日涨幅 ≥10% 时按 `crash_cut` 砍股票仓挪国债(Daniel-Moskowitz,正交于 trend/vol_target)。单元测试通过(暴涨触发+权重守恒,平稳不误触发);真数据验证待东财(`tmp/a1_verify.py`)
 - [ ] **[高] A2** 混合动量各窗口等权平均 — 位置:`blended_momentum` L107 — 应按半衰期/显著性加权,长窗口(126 日)通常更稳、权重应更高
 - [ ] **[中] A3** `SKIP_RECENT=0` 默认不跳最近一月 — 位置:`momentum_core` L32 — 经典 12-1 动量必跳最近一月;可在 `robust` 里补 skip 维度重测
 - [ ] **[中] A4** `RISK_ADJ` 用最长窗口的日波动做分母 — 位置:`blended_momentum` L109 — 应按各窗口对应波动或全程波动,口径可商榷,可重检验

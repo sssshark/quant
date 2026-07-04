@@ -60,6 +60,15 @@ LOOKBACK = MAX_LOOKBACK
 WEIGHTING = "equal"
 INV_VOL_WINDOW = 63                       # 反向波动加权估计日波动的回看窗口（约3个月，比 20 日稳）
 
+# ---- 动量崩溃保护（改进项 A1，Daniel-Moskowitz 2013）----
+# 大盘短期急剧反弹（暴跌后的暴力反转）是动量崩溃的典型前兆：前期强势标的滞涨、
+# 轮动切换滞后易大亏。检测到风向标近 CRASH_LOOKBACK 日涨幅 ≥ CRASH_THR 即降股票仓。
+# 与波动目标/趋势过滤正交：后者看"波动大小/长期方向"，本机制看"短期反弹速度"。
+CRASH_PROT = False                        # 默认关（向后兼容）；改 True 开启
+CRASH_LOOKBACK = 21                       # 检测"暴力反弹"的短期窗口（约1个月）
+CRASH_THR = 0.10                          # 该窗口涨幅 ≥10% 触发降仓（A 股月涨 10% 属急涨）
+CRASH_CUT = 0.5                           # 触发时股票仓保留比例（0.5=砍半挪国债）
+
 
 def _is_num(x):
     """是否为有效数字（排除 None 和 NaN）——价格序列里可能混入缺失值。"""
@@ -163,7 +172,9 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    cash_buffer=CASH_BUFFER, vol_target=VOL_TARGET,
                    vol_window=VOL_WINDOW, trend_ma=None, trend_code=TREND_CODE,
                    trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ,
-                   weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW):
+                   weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
+                   crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
+                   crash_thr=CRASH_THR, crash_cut=CRASH_CUT):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -244,4 +255,18 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
             moved = target[c] * (1 - trend_cut)        # 按"保留比例"缩仓
             target[c] *= trend_cut
             target[dcode] = target.get(dcode, 0.0) + moved
+
+    # === 第五步：动量崩溃保护（改进项 A1，Daniel-Moskowitz 2013） ===
+    #     大盘短期急剧反弹（暴跌后的暴力反转）是动量崩溃的典型前兆。风向标近
+    #     crash_lookback 日涨幅 ≥ crash_thr 时，按 crash_cut 降低股票仓、挪进防守资产。
+    #     与波动目标/趋势过滤正交（看的是"反弹速度"，三者只减不加、可叠加）。
+    if crash_prot:
+        arr = recent_closes.get(trend_code)
+        if arr and len(arr) > crash_lookback + 1:
+            past, now = arr[-1 - crash_lookback], arr[-1]
+            if _is_num(past) and _is_num(now) and past > 0 and now / past - 1 >= crash_thr:
+                for c in [c for c in target if c != dcode]:
+                    moved = target[c] * (1 - crash_cut)
+                    target[c] *= crash_cut
+                    target[dcode] = target.get(dcode, 0.0) + moved
     return target, picks
