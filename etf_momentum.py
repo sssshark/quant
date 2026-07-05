@@ -665,6 +665,72 @@ def _wf_report(oos_nav, oos_daily, report, full_best, oos_metrics):
     print("  （≥0.6 算扛得住过拟合；<0.4 说明回测明显拟合到样本内）")
 
 
+# ---------------- pcv：purged K-fold 交叉验证（G2，López de Prado AFML）----------------
+def purged_cv(px, n_splits=6, label_horizon=21, embargo=21, grid=None, metric="夏普"):
+    """Combinatorial Purged K-Fold（López de Prado《AFML》）：时间均分 n_splits 折，
+    轮流每折作 test、其余作 train，但
+      purge:   从 train 剔除 test 边界 ±label_horizon 的样本（动量隐含标签是未来收益，
+               train 样本若跨入 test 期即泄漏）
+      embargo: test 折后再剔除 embargo 天（防 test 信号经滚动窗口泄漏到后续 train）
+    train 在 grid 上选参、冻结到 test 评估；拼接所有 test 段得组合样本外净值。
+    与 wf 互补：wf 是重叠滚动单序列，本方法是非重叠 K-fold + purge/embargo（AFDL 标准），
+    给"样本外衰减"一个更严、多折交叉的估计。返回 (oos_nav, oos_daily, report, full_best, oos_metrics)。"""
+    if grid is None:
+        grid = WF_GRID
+    dates = px.index
+    start = dates[MAX_LOOKBACK]
+    end = dates[-1]
+    edges = pd.date_range(start, end, periods=n_splits + 1)         # 时间均分 n_splits 折（非重叠）
+    folds = [(edges[i], edges[i + 1]) for i in range(n_splits)]
+    cached = [(p, ) + backtest(px, **p)[:2] for p in grid]          # 复用 wf 的全期缓存（成本≈len(grid)）
+    oos_pieces, report = [], []
+    for te_s, te_e in folds:
+        pur_lo = te_s - pd.Timedelta(days=label_horizon)            # purge 下界
+        pur_hi = te_e + pd.Timedelta(days=embargo)                  # embargo 上界
+        def _train_part(daily):
+            m = (daily.index < pur_lo) | (daily.index > pur_hi)     # 全期 − test − purge/embargo
+            return daily[m]
+        best = None
+        for params, nav, daily in cached:
+            sc = _seg_perf(_train_part(daily))[metric]
+            if best is None or sc > best[0]:
+                best = (sc, params, daily)
+        tr_score, best_params, best_daily = best
+        te_daily = best_daily.loc[te_s:te_e]
+        te_score = _seg_perf(te_daily)[metric]
+        oos_pieces.append(te_daily)
+        report.append((te_s, te_e, best_params, tr_score, te_score))
+    oos_daily = pd.concat(oos_pieces)
+    oos_nav = (1 + oos_daily).cumprod()
+    oos_nav = oos_nav / oos_nav.iloc[0]
+    oos_metrics = perf(oos_nav, oos_daily)
+    full_best = None                                                 # 全样本 grid 最优（数据窥探上限）
+    for params, nav, daily in cached:
+        fp = perf(nav, daily)
+        if full_best is None or fp[metric] > full_best[0]:
+            full_best = (fp[metric], params, fp)
+    return oos_nav, oos_daily, report, full_best, oos_metrics
+
+
+def run_pcv(px):
+    """G2 子命令：跑 purged_cv 并打印各折 + 衰减。"""
+    oos_nav, oos_daily, report, full_best, oos_metrics = purged_cv(px)
+    fb_score, fb_params, fb_perf = full_best
+    print(f"Purged K-Fold CV（{len(report)} 折，purge 21 日 + embargo 21 日，López de Prado AFML）：\n")
+    print(f"{'测试折':<24}{'训练夏普':>9}{'测试夏普':>9}  选中参数")
+    for te_s, te_e, params, tr_score, te_score in report:
+        period = f"{te_s.date()}~{te_e.date()}"
+        ps = ", ".join(f"{k}={v}" for k, v in params.items())
+        print(f"{period:<24}{tr_score:>9.2f}{te_score:>9.2f}  {ps}")
+    print(f"\n全样本内 grid 最优（数据窥探上限）: {fb_params}")
+    print(f"  → 年化 {fb_perf['年化']*100:.1f}%  夏普 {fb_perf['夏普']:.2f}")
+    print(f"\n样本外（拼接 {len(report)} 个 purged 测试折，{oos_metrics['年数']:.1f} 年）:")
+    print(f"  → 年化 {oos_metrics['年化']*100:.1f}%  回撤 {oos_metrics['回撤']*100:.1f}%  夏普 {oos_metrics['夏普']:.2f}")
+    decay = oos_metrics['夏普'] / fb_perf['夏普'] if fb_perf['夏普'] > 0 else float("nan")
+    print(f"\n夏普衰减 = 样本外 / 全样本内 = {decay:.2f}")
+    print("  （≥0.6 扛得住过拟合；<0.4 明显拟合到样本内。purge+embargo 比 wf 更保守严谨）")
+
+
 # ---------------- boot：RISK_ADJ 提升的配对 block bootstrap ----------------
 def _circ_block_idx(T, block, rng):
     """circular block bootstrap 索引：把序列当成环，随机起点取连续 block 个，
@@ -964,6 +1030,9 @@ def main():
     if mode == "wf":
         oos_nav, oos_daily, report, full_best, oos_metrics = walk_forward(px)
         _wf_report(oos_nav, oos_daily, report, full_best, oos_metrics)
+        return
+    if mode == "pcv":
+        run_pcv(px)
         return
     if mode == "boot":
         _boot_report(bootstrap_risk_adj(px))
