@@ -11,6 +11,7 @@ A股 ETF 动量轮动 —— 向量化回测 / 研究工具。
   python etf_momentum.py robust     # 单参数扰动稳健性（看是不是"平台"，查过拟合）
   python etf_momentum.py wf         # walk-forward 滚动样本外（量化样本外夏普衰减）
   python etf_momentum.py boot       # RISK_ADJ 夏普提升的 bootstrap 显著性检验
+  python etf_momentum.py bootmom    # A2 混合动量加权 的 A/B + bootstrap 显著性检验
   python etf_momentum.py universe   # 标的池消融：踢掉黄金/纳指，量化 alpha 对池子的依赖
 """
 import sys
@@ -22,7 +23,7 @@ import matplotlib.pyplot as plt
 
 from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
                            VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, SKIP_RECENT,
-                           RISK_ADJ, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
+                           RISK_ADJ, LOOKBACK_WEIGHTS, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
                            DRAWDOWN_PROT, DD_WINDOW, DD_THR, DD_CUT,
                            _limit, decide_targets)
@@ -214,7 +215,8 @@ def _apply_target_with_limits(tgt_dict, prev_cur, fill_day, cant_buy, cant_sell)
 # ---------------- 回测引擎（调用核心大脑） ----------------
 def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_ma=None,
              trend_cut=TREND_CUT, vol_window=VOL_WINDOW, skip_recent=SKIP_RECENT,
-             risk_adj=RISK_ADJ, weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
+             risk_adj=RISK_ADJ, mom_weights=LOOKBACK_WEIGHTS,
+             weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
              crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
              crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
@@ -262,7 +264,8 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            top_n=top_n, vol_target=vol_target,
                                            vol_window=vol_window, trend_ma=trend_ma,
                                            trend_cut=trend_cut, skip_recent=skip_recent,
-                                           risk_adj=risk_adj, weighting=weighting,
+                                           risk_adj=risk_adj, mom_weights=mom_weights,
+                                           weighting=weighting,
                                            inv_vol_window=inv_vol_window,
                                            crash_prot=crash_prot,
                                            crash_lookback=crash_lookback,
@@ -579,6 +582,12 @@ def _circ_block_idx(T, block, rng):
     return idx[:T]
 
 
+def _ann_sharpe(x):
+    """日收益序列 → 年化夏普（无风险利率 0）；波动为 0 返回 0。block bootstrap 复用。"""
+    sd = x.std(ddof=1)
+    return (x.mean() / (sd + 1e-12)) * np.sqrt(252) if sd > 0 else 0.0
+
+
 def bootstrap_risk_adj(px, n_boot=2000, block=21, seed=7):
     """
     检验"风险调整动量"带来的夏普提升是否统计显著。risk_adj=True / False 共享除该开关
@@ -592,35 +601,82 @@ def bootstrap_risk_adj(px, n_boot=2000, block=21, seed=7):
     a1 = d1.loc[common].to_numpy()
     a0 = d0.loc[common].to_numpy()
     T = len(a1)
-
-    def _sr(x):
-        sd = x.std(ddof=1)
-        return (x.mean() / (sd + 1e-12)) * np.sqrt(252) if sd > 0 else 0.0
-
-    delta_obs = _sr(a1) - _sr(a0)
+    delta_obs = _ann_sharpe(a1) - _ann_sharpe(a0)
     rng = np.random.default_rng(seed)
     boots = np.empty(n_boot)
     for b in range(n_boot):
         idx = _circ_block_idx(T, block, rng)
-        boots[b] = _sr(a1[idx]) - _sr(a0[idx])
+        boots[b] = _ann_sharpe(a1[idx]) - _ann_sharpe(a0[idx])
     ci_lo, ci_hi = np.percentile(boots, [2.5, 97.5])
     return delta_obs, float(boots.mean()), float(ci_lo), float(ci_hi), float((boots <= 0).mean())
 
 
-def _boot_report(res):
+def bootstrap_mom_weights(px, weights, n_boot=2000, block=21, seed=7):
+    """
+    检验"混合动量各窗口加权（A2）"相对等权的夏普提升是否统计显著（改进项 A2）。
+    weights 与 LOOKBACKS 对齐；mom_weights=weights 与 =None（等权）共享其余一切、且都用
+    部署口径（vol_target + 趋势过滤），两条日收益高度相关，故配对 (dw, deq) 做 circular
+    block bootstrap。Δ = SR(dw) − SR(deq)；p = 重抽样里 Δ≤0 的比例（单边，越小越显著）。
+    返回 (delta_obs, boot_mean, ci_lo, ci_hi, p)。
+    注意：若 weights 是从多个候选里挑出的"最优"，p 值偏乐观（多重比较），判读需打折。
+    """
+    cfg = dict(trend_ma=TREND_MA)                  # 与部署口径一致（vol_target 取默认）
+    _, dw, _, _ = backtest(px, mom_weights=weights, **cfg)
+    _, deq, _, _ = backtest(px, mom_weights=None, **cfg)
+    common = dw.index.intersection(deq.index)
+    aw = dw.loc[common].to_numpy()
+    aeq = deq.loc[common].to_numpy()
+    T = len(aw)
+    delta_obs = _ann_sharpe(aw) - _ann_sharpe(aeq)
+    rng = np.random.default_rng(seed)
+    boots = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = _circ_block_idx(T, block, rng)
+        boots[b] = _ann_sharpe(aw[idx]) - _ann_sharpe(aeq[idx])
+    ci_lo, ci_hi = np.percentile(boots, [2.5, 97.5])
+    return delta_obs, float(boots.mean()), float(ci_lo), float(ci_hi), float((boots <= 0).mean())
+
+
+def _boot_report(res, title="RISK_ADJ（风险调整动量）夏普提升", on="risk_adj=True", off="False"):
+    """配对 block bootstrap 显著性检验的通用报告（默认措辞对应 RISK_ADJ）。
+    res = (delta_obs, boot_mean, ci_lo, ci_hi, p)；on/off 是被比较两侧的配置描述。"""
     delta_obs, mean, lo, hi, p = res
-    print("RISK_ADJ（风险调整动量）夏普提升的 bootstrap 显著性检验:\n")
-    print(f"  观测夏普差 Δ = SR(risk_adj=True) − SR(False) = {delta_obs:+.4f}")
+    print(f"{title} 的 bootstrap 显著性检验:\n")
+    print(f"  观测夏普差 Δ = SR({on}) − SR({off}) = {delta_obs:+.4f}")
     print(f"  配对 block bootstrap（n=2000, block=21 日）:")
     print(f"    均值 {mean:+.4f}    95% CI [{lo:+.4f}, {hi:+.4f}]    P(Δ≤0) = {p:.3f}")
     if lo > 0:
-        verdict = "显著为正（CI 整体 > 0）→ RISK_ADJ 的提升可信"
+        verdict = "显著为正（CI 整体 > 0）→ 提升可信，可考虑启用"
     elif hi < 0:
-        verdict = "显著为负 → RISK_ADJ 反而拖累，建议关闭"
+        verdict = "显著为负 → 反而拖累，建议关闭"
     else:
-        verdict = ("不显著（CI 跨 0）→ 那 ~0.04 的夏普差更可能是噪声，\n        "
-                   "建议关掉 RISK_ADJ 省一个过拟合自由度")
+        verdict = ("不显著（CI 跨 0）→ 观测到的夏普差更可能是噪声，\n        "
+                   "建议保持默认（省一个过拟合自由度）")
     print(f"\n  结论：{verdict}")
+
+
+def run_bootmom(px):
+    """A2 混合动量加权：先 A/B 几种单调加权方案（长窗口更高权）看指标景观，再对主候选
+    （权重∝窗口长度，无额外可调参数）做配对 block bootstrap 显著性检验。
+    多重比较提醒：主候选从一个小集合中选出，bootstrap p 值偏乐观，判读需打折。"""
+    cands = [("等权(基线)", None),
+             ("(1,2,3) 线性递增", (1, 2, 3)),
+             ("(1,2,4) 半衰期式", (1, 2, 4)),
+             ("(21,63,126) ∝长度", (21, 63, 126)),
+             ("(1,1,3) 仅抬长窗", (1, 1, 3))]
+    rows = []
+    for name, w in cands:
+        nav, daily, _, _ = backtest(px, mom_weights=w, trend_ma=TREND_MA)
+        rows.append((name, perf(nav, daily)))
+    print("A2 混合动量加权 A/B（默认全风控：vol_target + 趋势过滤）:\n")
+    _print_table(rows)
+
+    primary = (21, 63, 126)     # 权重∝窗口长度：无额外可调参数，最可辩护的"长窗口更高权"方案
+    print("\n" + "=" * 64)
+    _boot_report(bootstrap_mom_weights(px, primary),
+                 title="A2 混合动量加权（权重∝窗口长度 vs 等权）",
+                 on="mom_weights=(21,63,126)", off="等权")
+    print("  注：主候选从上述 5 元小集合中选出，p 值含多重比较偏误（偏乐观），判读需打折。")
 
 
 # ---------------- universe：标的池消融（alpha 对池子构成的依赖）----------------
@@ -734,6 +790,9 @@ def main():
         return
     if mode == "boot":
         _boot_report(bootstrap_risk_adj(px))
+        return
+    if mode == "bootmom":
+        run_bootmom(px)
         return
     if mode == "universe":
         run_universe(px)

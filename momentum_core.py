@@ -34,6 +34,17 @@ RISK_ADJ = False                       # 风险调整动量：动量÷该标的�
                                        #   配对 block bootstrap（n=2000）已验证其夏普提升不显著
                                        #   （Δ≈+0.04，95%CI 跨 0，P(Δ≤0)≈0.22）→ 判定为噪声而关闭，
                                        #   省一个过拟合自由度。改 True 可回退对照。
+# ---- 混合动量各窗口加权（改进项 A2）----
+# blended_momentum 默认对 1/3/6 月（21/63/126 日）动量取"等权平均"——短窗口（21 日，易受
+# 短期反转/噪声带偏）与长窗口（126 日，趋势信号更稳）被同等对待。经典 12-1 动量只用长形成期、
+# 跳过近一月，暗示长窗口信号更可靠。
+#   None → 等权（默认，向后兼容，回测/实盘默认不变）
+#   序列 → 与 LOOKBACKS 对齐的非负权重，加权平均 mom = Σ(wᵢ·vᵢ)/Σwᵢ（函数内归一，传入不必归一）。
+#          例 (1,2,3) 让 126 日权重是 21 日的 3 倍；(21,63,126) 即"权重∝窗口长度"——长窗口最高、
+#          无额外可调参数，是最可辩护的"长窗口更高权"方案。
+# 是否启用看配对 block bootstrap 显著性（etf_momentum.bootstrap_mom_weights）；不显著则保持默认
+# None（省一个过拟合自由度，与 RISK_ADJ 同理）。
+LOOKBACK_WEIGHTS = None
 MAX_LOOKBACK = max(LOOKBACKS)          # 需要的最少历史长度（注意：跳过期 skip 会额外吃历史，见 blended_momentum）
 TOP_N = 3                              # 持有动量最高的前 N 只（等权）
 CASH_BUFFER = 0.99                     # 目标仓位上限（留 1% 现金，吸收手续费/滑点）
@@ -116,15 +127,17 @@ def _asset_daily_vol(arr, end_idx, window):
     return var ** 0.5
 
 
-def blended_momentum(arr, lookbacks=LOOKBACKS, skip=SKIP_RECENT, risk_adj=RISK_ADJ):
+def blended_momentum(arr, lookbacks=LOOKBACKS, skip=SKIP_RECENT, risk_adj=RISK_ADJ, weights=LOOKBACK_WEIGHTS):
     """
-    多周期混合动量：各回看窗口涨幅的平均。历史不足任一窗口则返回 None（该标的本期不参与）。
+    多周期混合动量：各回看窗口涨幅的（加权）平均。历史不足任一窗口则返回 None（该标的本期不参与）。
     arr 是某只标的的收盘价序列（升序），arr[-1] 为当前价。
 
     skip:     跳过最近 skip 个交易日再算动量。学术界的"12-1 动量"经验——最近一个月常有
               短期反转，跳过它能让趋势信号更干净。end 改为 arr[-1-skip]，各窗口都往前挪 skip。
     risk_adj: True 时把混合动量除以该标的近期日波动，得到"风险调整动量"，
               倾向于选"涨得稳"的而非"涨得猛但很颠"的标的。
+    weights:  各窗口加权（A2），与 lookbacks 对齐。None=等权（默认）；序列则按 Σ(wᵢ·vᵢ)/Σwᵢ 加权，
+              长窗口可给更高权（趋势更稳）。None/长度不符/全 0 自动退化为等权，向后兼容。
     """
     if not arr:                                   # 空序列（如新上市标的早期无数据）
         return None
@@ -141,7 +154,14 @@ def blended_momentum(arr, lookbacks=LOOKBACKS, skip=SKIP_RECENT, risk_adj=RISK_A
         if not _is_num(past) or past == 0:
             return None
         vals.append(now / past - 1.0)             # 这个窗口的涨幅
-    mom = sum(vals) / len(vals)                   # 多窗口取平均 = 混合动量分
+    # 加权平均（A2）：weights 与 lookbacks 对齐；None/长度不符/全 0 → 退化为等权（向后兼容）。
+    #   负权无意义（让"涨"的窗口反向贡献），截到 0。传入不必归一，这里按 Σw 归一。
+    if weights and len(weights) == len(vals):
+        w = [max(float(x), 0.0) for x in weights]
+        sw = sum(w)
+        mom = sum(wi * vi for wi, vi in zip(w, vals)) / sw if sw > 0 else sum(vals) / len(vals)
+    else:
+        mom = sum(vals) / len(vals)               # 等权（默认）
     if risk_adj:                                  # 风险调整：动量 ÷ 波动（用最长窗口的日波动做分母）
         vol = _asset_daily_vol(arr, end, max(lookbacks))
         if not vol:
@@ -193,7 +213,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    cash_buffer=CASH_BUFFER, vol_target=VOL_TARGET,
                    vol_window=VOL_WINDOW, trend_ma=None, trend_code=TREND_CODE,
                    trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ,
-                   weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
+                   mom_weights=LOOKBACK_WEIGHTS, weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
                    crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
                    crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
                    drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
@@ -209,6 +229,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                      价跌破该均线视为大盘下行，按 trend_cut 缩小股票仓、其余挪防守资产。
       skip_recent:   算动量时跳过最近 N 个交易日（21≈跳过1个月，避开短期反转），透传给 blended_momentum。
       risk_adj:      是否用风险调整动量（动量÷波动），透传给 blended_momentum。
+      mom_weights:   混合动量各窗口加权（None=等权，默认）；序列则与 lookbacks 对齐、长窗口可更高权（A2），透传给 blended_momentum。
     输出:
       target: {code: 目标权重}，键可能含防守资产 DEFENSE[0]，权重和 ≈ cash_buffer。
       picks:  [中文名, ...]  本次实际持有的标的（用于日志）。
@@ -221,7 +242,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         arr = recent_closes.get(code)
         if arr is None:
             continue
-        m = blended_momentum(arr, lookbacks, skip=skip_recent, risk_adj=risk_adj)
+        m = blended_momentum(arr, lookbacks, skip=skip_recent, risk_adj=risk_adj, weights=mom_weights)
         if m is not None:                          # None = 历史不足，跳过
             moms.append((m, code))
 
