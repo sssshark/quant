@@ -12,9 +12,11 @@ A股 ETF 动量轮动 —— 向量化回测 / 研究工具。
   python etf_momentum.py wf         # walk-forward 滚动样本外（量化样本外夏普衰减）
   python etf_momentum.py boot       # RISK_ADJ 夏普提升的 bootstrap 显著性检验
   python etf_momentum.py bootmom    # A2 混合动量加权 的 A/B + bootstrap 显著性检验
+  python etf_momentum.py dsr        # G1 Deflated Sharpe：多重比较下的夏普可信度
   python etf_momentum.py universe   # 标的池消融：踢掉黄金/纳指，量化 alpha 对池子的依赖
 """
 import sys
+import math
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -30,6 +32,16 @@ from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
 
+# 已知 tushare 源数据永久断层（fund_daily 价格跳变、但无对应分红/拆分记录，无法从 tushare 修复）。
+# _load_via_tushare 截断断层前的数据（保留与近期价格连续的一侧），避免伪日收益（如 +248%）污染回测。
+# 代价：这些 ETF 的早期历史丢失（513100 纳指丢 2013-2021 等）。未来若接入东财（adjust=qfq 能正确
+# 处理拆分）可恢复。详见 IMPROVEMENTS E3/E4 与解决记录。
+_SOURCE_SHIFT = {
+    "510500": "2015-04-15",   # 中证500：~2 → ~8（断层前价格源错误）
+    "512100": "2022-09-05",   # 中证1000：~1 → ~2.7
+    "513100": "2022-01-14",   # 纳指：~5 → ~1（疑似拆分无记录）
+}
+
 
 # ---------------- 数据 ----------------
 def load_real(with_limits=False):
@@ -41,9 +53,11 @@ def load_real(with_limits=False):
     改进项 D2：with_limits=True 时额外返回 (cant_buy, cant_sell) 涨跌停掩码（收盘封板→
     对应方向无法成交）。掩码用未复权真实价算（前复权会扭曲涨跌幅）；未配置时返回纯 px（向后兼容）。"""
     res = _load_via_tushare(with_limits)
-    if res is not None:
-        return res
-    return _load_via_eastmoney(with_limits)
+    if res is None:
+        res = _load_via_eastmoney(with_limits)
+    px = res[0] if isinstance(res, tuple) else res
+    _data_quality_guard(px)          # E4：清洗后仍残留的不可成交伪迹大声告警
+    return res
 
 
 def _load_via_tushare(with_limits=False):
@@ -94,9 +108,16 @@ def _load_via_tushare(with_limits=False):
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
         try:
             div = _ts_post("fund_div", {"ts_code": tc(c)}, "ex_date,div_cash,div_proc")
-            divs = sorted([(r["ex_date"], float(r["div_cash"])) for _, r in div.iterrows()
-                           if r["div_proc"] == "实施" and pd.notna(r["ex_date"]) and pd.notna(r["div_cash"])],
-                          key=lambda x: x[0])
+            rows = [(r["ex_date"], float(r["div_cash"])) for _, r in div.iterrows()
+                    if r["div_proc"] == "实施" and pd.notna(r["ex_date"]) and pd.notna(r["div_cash"])
+                    and float(r["div_cash"]) > 0]
+            # tushare fund_div 对同一 ex_date 常返回完全相同的重复行（510880 某日 8× 同 div_cash），
+            # 逐条施加复权会过度下压历史价（→ +45% 伪跳变）。按 ex_date 去重保留一条：
+            # 重复行 div_cash 一致 = 同一笔分红被重复记录，非多笔独立分红。
+            seen, divs = set(), []
+            for ex_date, dc in sorted(rows, key=lambda x: x[0]):
+                if ex_date not in seen:
+                    seen.add(ex_date); divs.append((ex_date, dc))
         except Exception:
             divs = []
         time.sleep(0.6)
@@ -109,6 +130,10 @@ def _load_via_tushare(with_limits=False):
             if pre <= 0:
                 continue
             adj.loc[adj.index < ex_ts] *= (pre - dc) / pre
+        # 已知源数据永久断层（_SOURCE_SHIFT）：截断断层前数据（保留与近期价格连续的一侧），
+        # 否则跨断层的涨跌幅是伪收益（510500 +248% 等）。截断后该 ETF 在断层前不参与动量排序。
+        if c in _SOURCE_SHIFT:
+            adj.loc[adj.index < pd.Timestamp(_SOURCE_SHIFT[c])] = np.nan
         series[c] = adj
     px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
     ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
@@ -178,6 +203,25 @@ def limit_masks(raw_close, raw_pre_close):
         cant_buy[code] = cl >= (pc * (1 + lim)).round(2)
         cant_sell[code] = cl <= (pc * (1 - lim)).round(2)
     return cant_buy, cant_sell
+
+
+def _data_quality_guard(px, thr_mult=1.5):
+    """数据质量告警（改进项 E4）：清洗（去重复权 + 源断层截断）后若仍残留不可成交的伪日收益
+    （|环比|>thr_mult×涨跌停，ETF 最高 ±20%），大声告警——可能还有未发现的源 bug。仅告警不修改
+    （清洗在 loader 里做）。正常清洗后返回空清单；非空则需人工核查/补截断。"""
+    bad = []
+    for c in px.columns:
+        s = px[c].dropna()
+        if len(s) < 2:
+            continue
+        lim = _limit(c) * thr_mult
+        for d, v in s.pct_change().dropna()[lambda x: x.abs() > lim].items():
+            bad.append((c, pd.Timestamp(d).date(), v))
+    if bad:
+        print(f"[DQ告警] 清洗后仍发现 {len(bad)} 个不可成交伪迹（|日收益|>{thr_mult}×涨跌停）:")
+        for c, d, v in bad:
+            print(f"    {c}  {d}  {v*100:+.1f}%  （源数据 bug？需人工核查/截断）")
+    return bad
 
 
 def _hit(code, day, mask):
@@ -679,6 +723,90 @@ def run_bootmom(px):
     print("  注：主候选从上述 5 元小集合中选出，p 值含多重比较偏误（偏乐观），判读需打折。")
 
 
+# ---------------- dsr：Deflated Sharpe Ratio（多重比较下的夏普可信度，Bailey-López de Prado 2014）----------------
+def _norm_ppf(p):
+    """标准正态分位数 Φ⁻¹(p)（Acklam 算法 + 一次 Halley 精修，精度 ~1e-9）。纯 Python，免 scipy。p∈(0,1)。"""
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p <= 0.0 or p >= 1.0:
+        return float("nan")
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+            ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    elif p <= phigh:
+        q = p - 0.5; r = q*q
+        x = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+            (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+    else:
+        q = math.sqrt(-2 * math.log(1 - p))
+        x = -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+             ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    e = 0.5 * math.erfc(-x / math.sqrt(2)) - p        # Halley 一步精修
+    u = e * math.sqrt(2 * math.pi) * math.exp(x*x/2)
+    return x - u / (1 + x*u/2)
+
+
+def _norm_cdf(z):
+    """标准正态累积分布 Φ(z)（erfc 实现，满精度）。"""
+    return 0.5 * math.erfc(-z / math.sqrt(2))
+
+
+def deflated_sharpe(daily, n_trials, periods=252):
+    """Deflated Sharpe Ratio（Bailey & López de Prado, 2014，改进项 G1）：把观测夏普与
+    "N 次独立试验的期望最高夏普"比较，得到"观测夏普不只是多重比较运气的概率"。DSR>0.95 才算经得起。
+
+    口径（全用每期/日量，自洽）：
+      n      = 日观测数；SR̂ = 每期(日)夏普 = mean/std
+      γ₃     = 日收益偏度；γ₄ = 日收益普通峰度(Pearson，正态=3)
+      σ(SR̂) = √[(1 − γ₃·SR̂ + (γ₄−1)/4·SR̂²)/(n−1)]   （Mertens/Lo 非正态修正，肥尾左偏会放大 σ）
+      SR_max = σ · [(1−γ_emc)·Φ⁻¹(1−1/N) + γ_emc·Φ⁻¹(1−1/(N·e))]   （N 次试验期望最高，γ_emc=Euler-Mascheroni≈0.5772）
+      DSR    = Φ((SR̂ − SR_max)/σ)；PSR0 = Φ(SR̂/σ)（基准=0，即"真实夏普>0 的概率"）
+    返回 dict。注：N 是"等效独立试验数"的保守估计——真实研究里多数试验因不显著被弃、未真正
+    用于选参，故真实 N 更小、真实 DSR 更高（此处 N 偏大 → DSR 偏保守，是存疑方向上的下界）。"""
+    r = daily.values if hasattr(daily, "values") else list(daily)
+    n = len(r)
+    mean = sum(r) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in r) / (n - 1))
+    sr = mean / sd if sd > 0 else 0.0                       # 每期(日)夏普
+    g3 = sum((x - mean) ** 3 for x in r) / (n - 1) / sd**3   # 偏度
+    g4 = sum((x - mean) ** 4 for x in r) / (n - 1) / sd**4   # Pearson 峰度（正态=3）
+    var_sr = (1 - g3*sr + (g4 - 1)/4 * sr**2) / (n - 1)
+    sig = math.sqrt(var_sr) if var_sr > 0 else 1e-12        # SR̂ 标准误(每期)
+    emc = 0.5772156649015329                                # Euler-Mascheroni
+    sr_max = sig * ((1 - emc)*_norm_ppf(1 - 1/n_trials) + emc*_norm_ppf(1 - 1/(n_trials*math.e)))
+    return dict(SR_ann=sr*math.sqrt(periods), SR=sr, n=n, skew=g3, kurt=g4,
+                sig_ann=sig*math.sqrt(periods), SR_max_ann=sr_max*math.sqrt(periods),
+                PSR0=_norm_cdf(sr/sig), DSR=_norm_cdf((sr - sr_max)/sig), N=n_trials)
+
+
+def run_dsr(px):
+    """对部署策略（等权 + 全风控）与 C1 反向波动版算 Deflated Sharpe Ratio。
+    N 取敏感性 [10,50,100]：即"即使按做了 100 次试验的保守估计"，DSR 是否仍 >0.95。"""
+    _, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)
+    _, ret_iv, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, weighting="inv_vol")
+    print("Deflated Sharpe Ratio（Bailey-López de Prado 2014）— 多重比较下的夏普可信度:\n")
+    print(f"  样本: {len(ret_tr)} 日 ≈ {len(ret_tr)/252:.1f} 年   "
+          f"（γ₃偏度/γ₄峰度 取日收益，反映肥尾与左偏，σ(SR̂) 已据此修正）\n")
+    print(f"{'策略':<20}{'观测夏普':>9}{'N(试验)':>9}{'SR_max':>8}{'DSR':>8}{'PSR(>0)':>9}{'判读':>8}")
+    for name, daily in (("等权+全风控", ret_tr), ("反向波动+全风控", ret_iv)):
+        for N in (10, 50, 100):
+            r = deflated_sharpe(daily, N)
+            verdict = "可信" if r["DSR"] > 0.95 else ("边际" if r["DSR"] > 0.90 else "不足")
+            print(f"{name:<20}{r['SR_ann']:>9.3f}{N:>9}{r['SR_max_ann']:>8.3f}"
+                  f"{r['DSR']:>8.3f}{r['PSR0']:>9.3f}{verdict:>8}")
+    print("\n  解读:DSR = P(真实夏普 > 'N 次试验的期望最高运气夏普')。>0.95 才算经得起多重比较。")
+    print("        N 越大扣减越狠（N=100 列最保守）。真实独立试验数远小于 100——本项目多数改进")
+    print("        经 boot/wf 验证不显著后被弃、未用于选参，故真实 DSR 高于上表（上表是存疑下界）。")
+
+
 # ---------------- universe：标的池消融（alpha 对池子构成的依赖）----------------
 def _with_pool(sub_dict, fn):
     """临时把 momentum_core.POOL 和本模块 POOL 都换成 sub_dict、跑完 fn() 恢复。
@@ -793,6 +921,9 @@ def main():
         return
     if mode == "bootmom":
         run_bootmom(px)
+        return
+    if mode == "dsr":
+        run_dsr(px)
         return
     if mode == "universe":
         run_universe(px)
