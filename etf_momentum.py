@@ -106,34 +106,17 @@ def _load_via_tushare(with_limits=False):
         raw_d[c] = close
         pre_d[c] = fd["pre_close"].astype(float) if "pre_close" in fd else close.shift(1)
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
-        try:
-            div = _ts_post("fund_div", {"ts_code": tc(c)}, "ex_date,div_cash,div_proc")
-            rows = [(r["ex_date"], float(r["div_cash"])) for _, r in div.iterrows()
-                    if r["div_proc"] == "实施" and pd.notna(r["ex_date"]) and pd.notna(r["div_cash"])
-                    and float(r["div_cash"]) > 0]
-            # tushare fund_div 对同一 ex_date 常返回完全相同的重复行（510880 某日 8× 同 div_cash），
-            # 逐条施加复权会过度下压历史价（→ +45% 伪跳变）。按 ex_date 去重保留一条：
-            # 重复行 div_cash 一致 = 同一笔分红被重复记录，非多笔独立分红。
-            seen, divs = set(), []
-            for ex_date, dc in sorted(rows, key=lambda x: x[0]):
-                if ex_date not in seen:
-                    seen.add(ex_date); divs.append((ex_date, dc))
-        except Exception:
-            divs = []
-        time.sleep(0.6)
-        adj = close.copy(); adj.name = c
-        for ex_date, dc in divs:                           # 前复权：除权日之前价格 ×(前收盘-分红)/前收盘
-            ex_ts = pd.Timestamp(ex_date); before = close.index[close.index < ex_ts]
-            if len(before) == 0:
-                continue
-            pre = close.loc[before[-1]]
-            if pre <= 0:
-                continue
-            adj.loc[adj.index < ex_ts] *= (pre - dc) / pre
-        # 已知源数据永久断层（_SOURCE_SHIFT）：截断断层前数据（保留与近期价格连续的一侧），
-        # 否则跨断层的涨跌幅是伪收益（510500 +248% 等）。截断后该 ETF 在断层前不参与动量排序。
-        if c in _SOURCE_SHIFT:
-            adj.loc[adj.index < pd.Timestamp(_SOURCE_SHIFT[c])] = np.nan
+        # 前复权（E5 修正）：用 pre_close 列对齐除权/拆分，统一处理现金分红与份额拆分，
+        # 替代旧 fund_div + _SOURCE_SHIFT。旧方案两缺陷：① fund_div 不记录份额拆分，致拆分日
+        #   close 断崖（159928/513500/512010 等 -74%）漏过复权；② _SOURCE_SHIFT 把 510500/512100/513100
+        #   "pre_close 准但 close 断点"误判为源永久断层、过度截断（513100 丢 2013-2021 整段）。
+        #   实测 pre_close 对除权/拆分准确（close/pre_close 全期 max|ret|≤10%）：涨跌停时 pre_close=昨收，
+        #   仅除权/拆分时 pre_close≠close[t-1]。因子 f[t]=pre_close[t]/close[t-1]，前复权 adj[i]=close[i]×∏_{t>i}f[t]。
+        prev = close.shift(1)
+        f = (pre_d[c] / prev).fillna(1.0)            # f[t]=pre_close[t]/close[t-1]；偏离 1 = 除权/拆分
+        g = f[::-1].cumprod()[::-1]                  # g[i]=∏_{t≥i}f[t]
+        adj = close * g.shift(-1).fillna(1.0)        # adj[i]=close[i]×∏_{t>i}f[t]，最新价=close 末值不变
+        adj.name = c
         series[c] = adj
     px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
     ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
