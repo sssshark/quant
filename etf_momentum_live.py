@@ -11,7 +11,8 @@
 
 ★ 重要：
   - 需先在华泰开通 miniQMT/极简模式权限，并让 QMT 客户端在后台登录运行。
-  - 运行前务必把下面的 QMT_PATH / ACCOUNT_ID 改成你自己的。
+  - 实盘凭证（QMT_PATH / ACCOUNT_ID）不写进代码：从「环境变量 > 本地 live_config.json」
+    读取（见 _load_live_secret），配置方法见 live_config.example.json。
   - 真金白银交易请你本人确认后执行；建议先在模拟账户跑通。
   - 程序化交易需按交易所要求报备。
 
@@ -20,6 +21,7 @@
 """
 import os
 import sys
+import json
 import datetime as dt
 
 from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
@@ -43,9 +45,30 @@ MONTH_MARKER = os.path.join(os.path.dirname(__file__), "last_rebalance.txt")
 PAPER_STATE = os.path.join(os.path.dirname(__file__), "paper_account.json")  # 同理，放脚本旁边
 PAPER_INIT_CASH = 1_000_000.0                    # 模拟账户初始资金
 
-# --- qmt 真实接入（接入时改这两项） ---
-QMT_PATH = r"C:\华泰证券QMT\userdata_mini"       # ← 改成你本机 miniQMT 的 userdata_mini 路径
-ACCOUNT_ID = "你的资金账号"                        # ← 改成你的资金账号
+# --- 实盘凭证（改进项 H2：不硬编码、不入仓库） ---
+# QMT_PATH/ACCOUNT_ID 是机器/账户相关的敏感配置，从「环境变量 > 本地 live_config.json」读取，
+# 不写进源码、不入 git（live_config.json 已在 .gitignore）。两者都没配时回退占位值，
+# connect_trader() 会识别占位并拒绝连真实账户（保持 paper/演示，防误操作）。
+_QMT_PATH_DEFAULT = r"C:\华泰证券QMT\userdata_mini"   # 占位：未配置时用，触发"未配置"提示
+_ACCOUNT_ID_DEFAULT = "你的资金账号"                   # 同上
+
+
+def _load_live_secret(key, env_var, default):
+    """读实盘凭证，优先级：环境变量 env_var > 本地 live_config.json 的 key > default 占位。"""
+    val = os.environ.get(env_var)
+    if not val:                                  # 环境变量没给 → 试本地配置文件
+        cfg = os.path.join(os.path.dirname(__file__), "live_config.json")
+        if os.path.exists(cfg):
+            try:
+                with open(cfg, "r", encoding="utf-8") as f:
+                    val = json.load(f).get(key)
+            except Exception as e:
+                print(f"[warn] 读取 live_config.json 失败（{e}），用占位值。")
+    return val or default                        # 都没给 → 占位（连真实账户前会被拦下）
+
+
+QMT_PATH = _load_live_secret("qmt_path", "QMT_PATH", _QMT_PATH_DEFAULT)
+ACCOUNT_ID = _load_live_secret("account_id", "QMT_ACCOUNT_ID", _ACCOUNT_ID_DEFAULT)
 SESSION_ID = int(dt.datetime.now().timestamp())  # 任意整数，连接会话号
 DEMO_TOTAL = 100_000.0                            # 兜底：完全连不上时的假定总资产
 
@@ -79,6 +102,11 @@ def connect_trader():
         pt = PaperTrader(PAPER_STATE, PAPER_INIT_CASH, COMMISSION, SLIPPAGE, LOT)
         return ("paper", pt)
     # qmt
+    if QMT_PATH == _QMT_PATH_DEFAULT or ACCOUNT_ID == _ACCOUNT_ID_DEFAULT:
+        # H2：凭证仍是占位值（没配环境变量/live_config.json）→ 不连真实账户，降级演示。
+        print("[提示] 未配置实盘凭证 QMT_PATH / QMT_ACCOUNT_ID（环境变量或 live_config.json），"
+              "仍是占位值 → 演示模式。配置方法见 live_config.example.json。")
+        return None
     try:
         from xtquant.xttrader import XtQuantTrader
         from xtquant.xttype import StockAccount

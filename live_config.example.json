@@ -1,0 +1,5 @@
+{
+  "_comment": "实盘凭证样例——把本文件复制为 live_config.json（已 gitignore，不入仓库），填入你的真实值。也可改用环境变量 QMT_PATH / QMT_ACCOUNT_ID（优先级高于本文件）。两者都没配时，etf_momentum_live 回退占位值并拒绝连真实账户（只走 paper/演示）。",
+  "qmt_path": "C:\\华泰证券QMT\\userdata_mini",
+  "account_id": "你的资金账号"
+}

@@ -14,3 +14,7 @@ ETF动量轮动_回测结果.png
 
 # tushare 凭证（本地持有，不入仓库；_load_via_tushare 在环境变量缺失时回退读它）
 .tushare_token
+
+# 实盘凭证（本地持有，不入仓库；etf_momentum_live._load_live_secret 在环境变量缺失时读它）
+# 样例见 live_config.example.json
+live_config.json
