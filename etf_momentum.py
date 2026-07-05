@@ -106,7 +106,7 @@ def _load_via_tushare(with_limits=False):
         raw_d[c] = close
         pre_d[c] = fd["pre_close"].astype(float) if "pre_close" in fd else close.shift(1)
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
-        # 前复权（E5 修正）：用 pre_close 列对齐除权/拆分，统一处理现金分红与份额拆分，
+        # 前复权（pre_close 对齐法）：用 pre_close 列对齐除权/拆分，统一处理现金分红与份额拆分，
         # 替代旧 fund_div + _SOURCE_SHIFT。旧方案两缺陷：① fund_div 不记录份额拆分，致拆分日
         #   close 断崖（159928/513500/512010 等 -74%）漏过复权；② _SOURCE_SHIFT 把 510500/512100/513100
         #   "pre_close 准但 close 断点"误判为源永久断层、过度截断（513100 丢 2013-2021 整段）。
@@ -119,8 +119,7 @@ def _load_via_tushare(with_limits=False):
         adj.name = c
         series[c] = adj
     px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
-    ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
-    px = px.loc[ready[0]:]
+    px = _anchor_start(px)
     if with_limits:
         raw = pd.concat(raw_d, axis=1).sort_index().ffill()
         pc = pd.concat(pre_d, axis=1).sort_index().ffill()
@@ -159,8 +158,7 @@ def _load_via_eastmoney(with_limits=False):
         series[c] = df.set_index("日期")["收盘"].astype(float).rename(c)
     px = pd.concat(series.values(), axis=1).sort_index()
     px = px.dropna(how="all").ffill()
-    ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
-    px = px.loc[ready[0]:]
+    px = _anchor_start(px)
     if with_limits:
         cb, cs = limit_masks(px.copy(), px.shift(1))      # 复权环比近似
         return px, cb.fillna(False), cs.fillna(False)
@@ -205,6 +203,24 @@ def _data_quality_guard(px, thr_mult=1.5):
         for c, d, v in bad:
             print(f"    {c}  {d}  {v*100:+.1f}%  （源数据 bug？需人工核查/截断）")
     return bad
+
+
+def _anchor_start(px):
+    """起点锚定（E5 审视 2026-07-05）：回测从 BENCH+DEFENSE 都有数据的首个交易日开始。
+
+    纯数据首日驱动（首个非 NaN，ffill 不改首日），不依赖收益 → 无硬前视。
+    截到此处是有意设计：保证起点时核心池基本就绪，避免早期"只有少数早上市标的"
+    的不代表性段（若提前起点，POOL 多数标的未上市 → 动量凑不齐 top_n → 长期空仓扭曲统计，
+    且相当于又一轮重定基线、方向错误）。微弱"前视"仅存于方法论层：BENCH/DEFENSE 是人为选定，
+    起点随资产选择间接固定（见 B1 前视教训），代码层无法根除。本函数打印审计行让隐性锚定
+    显性化，便于复现/审计/未来 E1 起点敏感性测试。"""
+    ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
+    start = ready[0]
+    missing = [c for c in POOL if px[c].loc[:start].isna().all()]   # 起点时尚未上市的 POOL 标的
+    print(f"[E5 起点] ready[0]={start.date()}（{BENCH}+{DEFENSE[0]} 首个共同非NaN日，"
+          f"数据驱动非收益→无前视）；起点时 POOL 未就绪: {missing or '无'}"
+          f"（上市晚于起点，动量排序 dropna 自动跳过）")
+    return px.loc[start:]
 
 
 def _hit(code, day, mask):
@@ -347,6 +363,54 @@ def perf(nav, daily):
     omega = gains / (losses + 1e-12)
     return dict(总收益=nav.iloc[-1]-1, 年化=cagr, 波动=vol, 夏普=sharpe,
                 Sortino=sortino, Calmar=calmar, Omega=omega, 回撤=mdd, 年数=years)
+
+
+def factor_attribution(daily, bench_daily):
+    """F4 因子归因：策略日收益对基准做 CAPM 单因子回归，拆 alpha/beta + 信息比率。
+    回答"跑赢基准多少是真 alpha、多少是 beta 暴露"。无风险利率/MAR 按 0（与 perf 口径一致）。
+    返回 dict（None=数据不足或基准零波动）：年化alpha、beta、IR、R²、年化跟踪误差、
+    策略/基准/超额年化、相关性。"""
+    common = daily.index.intersection(bench_daily.index)
+    p = daily.loc[common].to_numpy()
+    b = bench_daily.loc[common].to_numpy()
+    if len(p) < 2 or b.var(ddof=1) <= 1e-12:
+        return None
+    beta = float(np.cov(p, b, ddof=1)[0, 1] / b.var(ddof=1))     # 市场暴露（斜率）
+    alpha_d = float(p.mean() - beta * b.mean())                  # 日 alpha（Jensen 截距）
+    alpha_ann = alpha_d * 252                                     # 年化（线性，与夏普口径一致）
+    active = p - b                                                # 主动收益 = 策略 − 基准
+    te_d = float(active.std(ddof=1))                             # 日跟踪误差
+    ir = float((active.mean() / (te_d + 1e-12)) * np.sqrt(252)) if te_d > 0 else 0.0
+    corr = float(np.corrcoef(p, b)[0, 1])
+    years = (daily.index[-1] - daily.index[0]).days / 365.25    # 与 perf 口径一致（自然日）
+    def _ann(x):
+        return (np.prod(1 + x) ** (1 / years) - 1) if years > 0 else 0.0
+    return dict(年化alpha=alpha_ann, beta=beta, IR=ir, R2=corr * corr,
+                年化跟踪误差=te_d * np.sqrt(252), 相关性=corr,
+                策略年化=_ann(p), 基准年化=_ann(b), 超额年化=_ann(p) - _ann(b))
+
+
+def run_attribution(px, lim=None, title=""):
+    """F4 因子归因子命令：全风控口径（vol+trend）跑一次 backtest，对基准做 CAPM 回归拆 alpha/beta/IR。
+    与 run_regime 同源（都用全风控 backtest + 基准对照）。打印归因表，返回 dict。"""
+    lim = lim or {}
+    nav, daily, n, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, **lim)
+    bench = px[BENCH].pct_change().fillna(0.0).reindex(daily.index).fillna(0.0)
+    a = factor_attribution(daily, bench)
+    if a is None:
+        print("归因失败：数据不足或基准零波动")
+        return None
+    print(f"\n=== 因子归因{'（' + title + '）' if title else ''}（CAPM 单因子 vs {BENCH} 沪深300）===")
+    print(f"  策略年化 {a['策略年化']*100:.1f}%  vs  基准年化 {a['基准年化']*100:.1f}%"
+          f"  →  超额年化 {a['超额年化']*100:+.1f}%")
+    print(f"  beta = {a['beta']:.2f}   （市场暴露：基准每涨1%，策略理论涨 {a['beta']:.2f}%）")
+    print(f"  年化 alpha = {a['年化alpha']*100:+.1f}%   （Jensen 超额：扣除 beta 暴露后的纯 alpha）")
+    print(f"  信息比率 IR = {a['IR']:.2f}   （主动收益 / 跟踪误差；>0.5 优秀、>1.0 顶尖）")
+    print(f"  R² = {a['R2']:.2f}   相关性 {a['相关性']:.2f}   年化跟踪误差 {a['年化跟踪误差']*100:.1f}%")
+    beta_drag = (a['beta'] - 1) * a['基准年化']                  # 低 beta 拖累（beta<1 为负：基准涨时策略少赚）
+    print(f"  → 超额 {a['超额年化']*100:+.1f}% ≈ alpha {a['年化alpha']*100:+.1f}% + beta 拖累 {beta_drag*100:+.1f}%"
+          f"（beta={a['beta']:.2f}：低市场暴露，基准上涨时少赚，须靠 alpha 补回）")
+    return a
 
 
 def rolling_metrics(daily, window=252):
@@ -883,8 +947,8 @@ def main():
         return
     # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
     # real/regime 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图/复核/regime 拆解用。
-    loaded = load_real(with_limits=(mode in ("real", "regime")))
-    if mode in ("real", "regime"):
+    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib")))
+    if mode in ("real", "regime", "attrib"):
         px, cant_buy, cant_sell = loaded
     else:
         px, cant_buy, cant_sell = loaded, None, None
@@ -910,6 +974,9 @@ def main():
         return
     if mode == "universe":
         run_universe(px)
+        return
+    if mode == "attrib":
+        run_attribution(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
     if mode == "regime":
         run_regime(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))

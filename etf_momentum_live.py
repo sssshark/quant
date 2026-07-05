@@ -35,6 +35,7 @@ BROKER = "paper"                                 # "paper"=本地模拟账户跑
 DRY_RUN = True                                   # 仅对 qmt 生效：True=只打印不下单；paper 始终模拟成交
 LOT = 100                                        # ETF 最小交易单位（股）
 REBALANCE_BAND = 0.05                             # 再平衡静默区：偏离<5%总资产的小漂移不调仓
+RECONCILE_THR = 0.10                              # H1 对账阈值：偏离>10%总资产告警（>band，避免整手/静默区固有偏离误报）
 ONCE_PER_MONTH = True                             # True=每月只调一次（适合每日定时触发）
 MONTH_END_ONLY = True                             # True=只在"本月最后一个交易日"调仓，与回测月末口径对齐（force 可绕过）
 # os.path.dirname(__file__) 是“本脚本所在目录”，拼上文件名 → 标记文件放在脚本旁边，
@@ -208,6 +209,49 @@ def _label(code):
     return POOL.get(code, DEFENSE[1] if code == DEFENSE[0] else code)
 
 
+def _weights_from_positions(positions, total, price):
+    """实盘持仓 {code: 股数} → 权重 {code: 市值/总资产}，含 '__cash__' 现金币种（H1 对账用）。"""
+    w = {}
+    for c, vol in positions.items():
+        px = price.get(c, 0.0)
+        if px and total > 0:
+            w[c] = w.get(c, 0.0) + vol * px / total
+    if total > 0:
+        w["__cash__"] = max(0.0, 1.0 - sum(w.values()))     # 现金 = 1 − 已投（≥0）
+    return w
+
+
+def reconcile(target, positions, total, price, thr=RECONCILE_THR, when=""):
+    """H1 回测-实盘对账（reconciliation）：把模型目标权重（target）与实盘实际持仓（positions）
+    换算到同一权重口径后逐币种比，偏离 ≥ thr 告警。机构标配——回测再好，实盘偏离就白搭。
+      when='调仓前': 实盘累积持仓 vs 当前模型 target → 抓跨月漂移 / 上次调仓未完整执行 / 分红或手工操作。
+      when='调仓后': 刚执行完的持仓 vs 本次 target → 抓涨跌停/拒单致下单未全成交（实盘最关键）。
+    只读对比、不改交易、不抛异常（对账失败不应阻断调仓）。返回最大绝对偏离，便于落日志。"""
+    if total <= 0:
+        print(f"[H1 对账·{when}] 总资产≤0，跳过")
+        return 0.0
+    actual = _weights_from_positions(positions, total, price)
+    tgt = dict(target)
+    tgt["__cash__"] = max(0.0, 1.0 - sum(tgt.values()))        # 目标也补现金币种，口径对齐
+    diffs = [(c, tgt.get(c, 0.0), actual.get(c, 0.0),
+              actual.get(c, 0.0) - tgt.get(c, 0.0))
+             for c in set(tgt) | set(actual)]
+    diffs.sort(key=lambda x: -abs(x[3]))
+    max_abs = abs(diffs[0][3]) if diffs else 0.0
+    tag = f"[H1 对账·{when}] " if when else "[H1 对账] "
+    over = [(c, tw, aw, d) for c, tw, aw, d in diffs if abs(d) >= thr]
+    if over:
+        print(f"{tag}实盘 vs 模型偏离 ≥ {thr*100:.0f}% 总资产：")
+        for c, tw, aw, d in over:
+            name = "__现金__" if c == "__cash__" else _label(c)
+            print(f"    {str(name):8s} 应有{tw:6.1%}  实际{aw:6.1%}  偏离{d*100:+5.1f}pp "
+                  f"({'超配' if d > 0 else '低配'})")
+        print("    → 可能：跨月价格漂移 / 上次调仓未完整执行 / 分红或手工操作 / 本次涨跌停跳单")
+    else:
+        print(f"{tag}实盘与模型一致（最大偏离 {max_abs*100:.1f}% < 阈值 {thr*100:.0f}%）")
+    return max_abs
+
+
 # ---------------- 每月只调一次的闸 ----------------
 def _this_month():
     return dt.date.today().strftime("%Y-%m")    # 当前年月，如 "2026-06"
@@ -284,6 +328,7 @@ def main():
     ctx = connect_trader()
     total, positions = read_account(ctx, price)
     print(f"账户总资产: {total:,.0f}  当前持仓: {positions or '无'}")
+    reconcile(target, positions, total, price, when="调仓前")   # H1：调仓前先对账（抓跨月漂移/上次未完整执行）
 
     orders = build_orders(target, recent, total, positions,
                           cant_buy_today=cant_buy_today, cant_sell_today=cant_sell_today)
@@ -309,8 +354,11 @@ def main():
     if kind == "paper":
         total2, pos2 = read_account(ctx, price)
         print(f"\n[paper] 已模拟成交。期末总资产: {total2:,.0f}  持仓: {pos2}")
+        reconcile(target, pos2, total2, price, when="调仓后")   # H1：调仓后对账（paper 全成交，应≈一致）
         print(f"账户状态已保存到 {os.path.basename(PAPER_STATE)}（下次运行会接着用）。")
     else:
+        total2, pos2 = read_account(ctx, price)
+        reconcile(target, pos2, total2, price, when="调仓后")   # H1：调仓后对账（qmt 订单在途可能偏离，超阈需核对成交）
         print("\n已提交全部订单。请到 QMT 客户端核对成交。")
 
 
