@@ -371,6 +371,53 @@ def _seg_perf(daily_seg):
     return perf(nav, daily_seg)
 
 
+# ---------------- F3：分 regime（牛/熊/震荡）表现拆解 ----------------
+def regime_labels(px, bear_dd=-0.20, trend_ma=200):
+    """按基准（沪深300）市场状态给每日打 regime 标签（改进项 F3）：
+    熊市=从历史高点回撤超 bear_dd（默认20%）；牛市=非熊 且净值在 trend_ma 日均线之上；
+    震荡=其余。用基准而非策略净值，刻画的是"市场 regime"本身、与持仓无关。"""
+    bench = px[BENCH].ffill().dropna()
+    nav = (1 + bench.pct_change().fillna(0)).cumprod()
+    nav = nav / nav.iloc[0]
+    dd = nav / nav.cummax() - 1                       # 回撤序列（负值）
+    bear = dd < bear_dd                               # 回撤超阈值=熊
+    ma = nav.rolling(trend_ma).mean()
+    bull = (~bear) & (nav > ma)                       # 非熊 + 站上均线=牛
+    lab = pd.Series("震荡", index=nav.index)
+    lab[bear] = "熊市"; lab[bull] = "牛市"
+    return lab
+
+
+def run_regime(px, daily=None, title="", lim=None):
+    """分 regime 表现：把日收益按基准 regime 切片，每段 _seg_perf 重建净值算指标。
+    daily 已给则直接拆（复用 real 的 ret_tr/ret_iv），否则用默认参数（等权+趋势+波动目标）
+    跑一次 backtest（传 lim 走 D1/D2 新口径，与 real 一致）。同时打印基准同 regime 对照，
+    看策略在哪种行情跑赢/跑输基准。"""
+    if daily is None:
+        _, daily, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, **(lim or {}))
+    lab = regime_labels(px).reindex(daily.index).fillna("震荡")
+    bench_daily = px[BENCH].pct_change().fillna(0).reindex(daily.index).fillna(0)
+    head = f"{'regime':<10}{'天数':>7}{'占比':>7}{'年化':>9}{'夏普':>7}{'最大回撤':>10}{'Sortino':>9}"
+    def _rows(series):
+        out = []
+        for r in ["牛市", "熊市", "震荡"]:
+            seg = series[lab == r]
+            if len(seg) < 2:
+                continue
+            out.append((r, len(seg), len(seg) / len(daily), _seg_perf(seg)))
+        return out
+    print(f"\n=== 分 regime 表现{'（' + title + '）' if title else ''} ===")
+    print(head)
+    for name, n, share, p in _rows(daily):
+        print(f"{name:<10}{n:>7}{share*100:>6.1f}%{p['年化']*100:>8.1f}%"
+              f"{p['夏普']:>7.2f}{p['回撤']*100:>9.1f}%{p['Sortino']:>9.2f}")
+    print("  —— 基准(沪深300)同 regime 对照 ——")
+    print(head)
+    for name, n, share, p in _rows(bench_daily):
+        print(f"{name+'(基准)':<10}{n:>7}{share*100:>6.1f}%{p['年化']*100:>8.1f}%"
+              f"{p['夏普']:>7.2f}{p['回撤']*100:>9.1f}%{p['Sortino']:>9.2f}")
+
+
 # ---------------- robust：单参数扰动稳健性 ----------------
 def run_robust(px):
     """
@@ -668,9 +715,9 @@ def main():
         run_review()
         return
     # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
-    # real 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图与复核用。
-    loaded = load_real(with_limits=(mode == "real"))
-    if mode == "real":
+    # real/regime 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图/复核/regime 拆解用。
+    loaded = load_real(with_limits=(mode in ("real", "regime")))
+    if mode in ("real", "regime"):
         px, cant_buy, cant_sell = loaded
     else:
         px, cant_buy, cant_sell = loaded, None, None
@@ -690,6 +737,9 @@ def main():
         return
     if mode == "universe":
         run_universe(px)
+        return
+    if mode == "regime":
+        run_regime(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
 
     # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准（real 模式带 D1/D2 新口径）
@@ -749,6 +799,10 @@ def main():
         if len(rs):
             print(f"  {name}: 滚动夏普 均值{rs.mean():.2f} / 最差{rs.min():.2f} / "
                   f"占比>0 {(rs > 0).mean() * 100:.0f}%")
+
+    # F3 分 regime（牛/熊/震荡）拆解：看策略在哪种行情有效、是否跑赢基准
+    run_regime(px, ret_tr, "等权+趋势")
+    run_regime(px, ret_iv, "反向波动+趋势")
 
 
 if __name__ == "__main__":
