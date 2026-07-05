@@ -217,7 +217,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
                    crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
                    drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
-                   dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None):
+                   dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None, max_weight=None):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -279,6 +279,14 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         else:                                                   # 动量≤0 → 这一份切防守资产（国债）
             target[dcode_cash] = target.get(dcode_cash, 0.0) + w
             picks.append(DEFENSE[1])
+
+    # C3 单标的集中度上限(默认 None 关):个股权重超 max_weight 的部分挪防守资产。
+    #   等权 top_n=3 下单只≈33%、默认不触发;启用 inv_vol(C1)或集中 top_n 时可设(如 0.40)。
+    if max_weight:
+        for c in [c for c in target if c != dcode and target[c] > max_weight]:
+            excess = target[c] - max_weight
+            target[c] = max_weight
+            target[dcode_cash] = target.get(dcode_cash, 0.0) + excess
 
     # === 第三步：波动率目标。组合近期波动超标 → 整体缩股票仓，缩出来的挪进防守资产 ===
     eq_codes = [c for c in target if c != dcode]   # 真正持有的股票（不含国债）

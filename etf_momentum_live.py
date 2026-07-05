@@ -159,13 +159,14 @@ def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
     cant_buy_today = cant_buy_today or set()
     cant_sell_today = cant_sell_today or set()
     price = {c: arr[-1] for c, arr in recent.items()}   # 各标的现价 = 序列最后一个收盘
-    # 目标股数 = 目标市值 / 现价，再向下取整到整百股。
-    # 写法解析：total*w/px 是理论股数；// LOT 整除得“多少个100股”；再 *LOT 还原成股数。
+    # 目标股数 = 目标市值 / 现价，再四舍五入到整百股（D5：替代原向下取整，避免长期欠仓累积；
+    #   cash_buffer=0.99 留 1% 现金兜底四舍五入的小幅超买）。
+    # 写法解析：total*w/px 是理论股数；/LOT 得“多少个100股”；+0.5 再 int 实现四舍五入（五入）。
     want = {}
     for code, w in target.items():
         px = price.get(code)
         if px:
-            want[code] = int(total * w / px // LOT) * LOT
+            want[code] = int(total * w / px / LOT + 0.5) * LOT
 
     sells, buys = [], []
     # set(positions) | set(want)：当前持仓代码 与 目标代码 的并集（| 是集合求并），

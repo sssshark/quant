@@ -264,7 +264,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
              dd_thr=DD_THR, dd_cut=DD_CUT,
-             cant_buy=None, cant_sell=None, defense_cash=None, return_turnover=False):
+             cant_buy=None, cant_sell=None, defense_cash=None, max_weight=None, return_turnover=False):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
         的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
@@ -315,7 +315,8 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            crash_thr=crash_thr, crash_cut=crash_cut,
                                            drawdown_prot=drawdown_prot,
                                            dd_window=dd_window,
-                                           dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash)
+                                           dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash,
+                                           max_weight=max_weight)
             if target:
                 pending = (target, picks)                  # 不立即写 cur，等下一日成交
                 holdings_log.append((d.date(), picks))
@@ -346,6 +347,16 @@ def bench_nav(px):
     return nav / nav.iloc[0]
 
 
+def bench_6040(px):
+    """F7 股债 60-40 基准(60% 沪深300 + 40% 国债 ETF),经典被动组合对照。
+    比纯沪深300 更能体现"被动持有"的可比基准(含债券缓冲)。"""
+    start = px.index[MAX_LOOKBACK]
+    stock = px[BENCH].pct_change().fillna(0.0)
+    bond = px[DEFENSE[0]].pct_change().fillna(0.0)
+    nav = (1 + 0.6 * stock + 0.4 * bond).cumprod().loc[start:]
+    return nav / nav.iloc[0]
+
+
 # ---------------- 绩效指标 ----------------
 def perf(nav, daily):
     """根据净值曲线 nav 和日收益 daily 算常用绩效指标。
@@ -363,8 +374,12 @@ def perf(nav, daily):
     gains = daily[daily > 0].sum()
     losses = -daily[daily < 0].sum()
     omega = gains / (losses + 1e-12)
+    # C4 尾部风险：VaR(α 分位的日损失)、CVaR(尾部条件期望=平均最大日损失)
+    var_95 = float(daily.quantile(0.05)); var_99 = float(daily.quantile(0.01))
+    cvar_95 = float(daily[daily <= var_95].mean()); cvar_99 = float(daily[daily <= var_99].mean())
     return dict(总收益=nav.iloc[-1]-1, 年化=cagr, 波动=vol, 夏普=sharpe,
-                Sortino=sortino, Calmar=calmar, Omega=omega, 回撤=mdd, 年数=years)
+                Sortino=sortino, Calmar=calmar, Omega=omega, 回撤=mdd, 年数=years,
+                VaR95=var_95, CVaR95=cvar_95, VaR99=var_99, CVaR99=cvar_99)
 
 
 def factor_attribution(daily, bench_daily):
@@ -427,12 +442,13 @@ def rolling_metrics(daily, window=252):
 
 
 def _print_table(rows):
-    """rows: [(名称, perf字典)]。Sortino/Calmar/Omega 见改进项 F1。"""
-    print(f"{'策略':<22}{'总收益':>9}{'年化':>8}{'波动':>8}{'最大回撤':>9}{'夏普':>7}{'Sortino':>9}{'Calmar':>8}{'Omega':>8}")
+    """rows: [(名称, perf字典)]。Sortino/Calmar/Omega 见 F1;VaR95/CVaR95 见 C4(尾部风险)。"""
+    print(f"{'策略':<22}{'总收益':>9}{'年化':>8}{'波动':>8}{'最大回撤':>9}{'夏普':>7}{'Sortino':>9}{'Calmar':>8}{'Omega':>8}{'VaR95':>8}{'CVaR95':>9}")
     for name, p in rows:
         print(f"{name:<22}{p['总收益']*100:>8.1f}%{p['年化']*100:>7.1f}%"
               f"{p['波动']*100:>7.1f}%{p['回撤']*100:>8.1f}%{p['夏普']:>7.2f}"
-              f"{p['Sortino']:>9.2f}{p['Calmar']:>8.2f}{p['Omega']:>8.2f}")
+              f"{p['Sortino']:>9.2f}{p['Calmar']:>8.2f}{p['Omega']:>8.2f}"
+              f"{p['VaR95']*100:>7.2f}%{p['CVaR95']*100:>8.2f}%")
 
 
 # ---------------- 主流程 ----------------
@@ -731,6 +747,50 @@ def run_pcv(px):
     print("  （≥0.6 扛得住过拟合；<0.4 明显拟合到样本内。purge+embargo 比 wf 更保守严谨）")
 
 
+# ---------------- pbo：backtest 过拟合概率（G3，Bailey-López de Prado 2017）----------------
+def pbo(px, n_splits=6, label_horizon=21, embargo=21, grid=None, metric="夏普"):
+    """G3 Probability of Backtest Overfitting（Bailey-López de Prado 2017，简化排名法）：
+    purged K-fold 每折：train 选 ISC（样本内）最优参数、看该参数在该折 test 段的 OOS 排名
+    （0=最好）。PBO = 最优参数在 test 排名落下半（≥N/2）的折占比。>0.5 = 过拟合
+    （样本内最优→样本外系统性差）；<0.5 = 未过拟合。返回 (pbo值, 各折排名列表)。"""
+    if grid is None:
+        grid = WF_GRID
+    dates = px.index
+    start = dates[MAX_LOOKBACK]
+    end = dates[-1]
+    edges = pd.date_range(start, end, periods=n_splits + 1)
+    folds = [(edges[i], edges[i + 1]) for i in range(n_splits)]
+    cached = [(p, ) + backtest(px, **p)[:2] for p in grid]
+    N = len(cached)
+    half = N // 2
+    ranks = []
+    for te_s, te_e in folds:
+        pur_lo = te_s - pd.Timedelta(days=label_horizon)
+        pur_hi = te_e + pd.Timedelta(days=embargo)
+        def _train(daily):
+            m = (daily.index < pur_lo) | (daily.index > pur_hi)
+            return daily[m]
+        tr = [_seg_perf(_train(daily))[metric] for _, _, daily in cached]
+        best = int(np.argmax(tr))
+        te = [_seg_perf(daily.loc[te_s:te_e])[metric] for _, _, daily in cached]
+        order = sorted(range(N), key=lambda i: te[i], reverse=True)
+        ranks.append(order.index(best))
+    pbo_val = sum(1 for r in ranks if r >= half) / len(ranks)
+    return pbo_val, ranks
+
+
+def run_pbo(px):
+    """G3 子命令：跑 pbo 并打印。"""
+    pbo_val, ranks = pbo(px)
+    N = len(WF_GRID)
+    print(f"PBO 过拟合概率（{len(ranks)} 折 purged K-fold + 排名法，Bailey-LdP 2017）：")
+    print(f"  各折 ISC 最优参数在 test 的排名（0=最好，共 {N} 个候选）: {ranks}")
+    print(f"  落下半（≥{N//2}）的折数: {sum(1 for r in ranks if r >= N//2)}/{len(ranks)}")
+    print(f"  PBO = {pbo_val:.2f}")
+    print(f"  → {'未过拟合（<0.5）：样本内最优在样本外非系统性垫底' if pbo_val < 0.5 else '过拟合警告（≥0.5）：样本内最优→样本外系统性差'}")
+    print("  （与 G1 DSR、wf 衰减、pcv 四重过拟合检验互补）")
+
+
 # ---------------- boot：RISK_ADJ 提升的配对 block bootstrap ----------------
 def _circ_block_idx(T, block, rng):
     """circular block bootstrap 索引：把序列当成环，随机起点取连续 block 个，
@@ -955,6 +1015,8 @@ def run_universe(px, drop=("518880", "513100")):
     rows.append(("踢掉黄金+纳指", perf(nav2, daily2)))
     bn = bench_nav(px)
     rows.append(("买入持有沪深300", perf(bn, bn.pct_change().fillna(0))))
+    bn6040 = bench_6040(px)
+    rows.append(("股债60-40(被动)", perf(bn6040, bn6040.pct_change().fillna(0))))
     _print_table(rows)
     d_sharpe = rows[0][1]["夏普"] - rows[1][1]["夏普"]
     d_cagr = (rows[0][1]["年化"] - rows[1][1]["年化"]) * 100
@@ -1033,6 +1095,9 @@ def main():
         return
     if mode == "pcv":
         run_pcv(px)
+        return
+    if mode == "pbo":
+        run_pbo(px)
         return
     if mode == "boot":
         _boot_report(bootstrap_risk_adj(px))
