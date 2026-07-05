@@ -65,6 +65,19 @@ def test_build_orders_rounding():
     assert any(c == "510300" and s == "BUY" and sh == 1300 for c, s, sh in orders)
 
 
+def test_limit_pct():
+    """D2: 涨跌停档——显式表(创业板159915=20%)、科创板前缀(588=20%)、跨境/商品/主板默认10%。
+    关键回归：159941 纳指跨境虽 159 开头但不是创业板 → 必须 10%（防未来误加 159 前缀把跨境判成20%）。"""
+    assert mc._limit("159915") == 0.20   # 创业板（显式表）
+    assert mc._limit("588000") == 0.20   # 科创板（588 前缀兜底）
+    assert mc._limit("588050") == 0.20   # 科创板
+    assert mc._limit("510300") == 0.10   # 主板沪深300
+    assert mc._limit("513100") == 0.10   # 跨境 QDII 纳指
+    assert mc._limit("159941") == 0.10   # 159 段跨境纳指（防前缀误判为 20%）
+    assert mc._limit("518880") == 0.10   # 商品黄金
+    assert mc._limit("511010") == 0.10   # 国债
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":
