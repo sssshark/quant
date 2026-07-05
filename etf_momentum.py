@@ -64,18 +64,27 @@ def _load_via_tushare(with_limits=False):
             token = open(_tf, encoding="utf-8").read().strip()
     if not token:
         return None
-    import tushare as ts, time
-    ts.set_token(token)
-    pro = ts.pro_api()
-    # 默认走 stockai888 代理（本项目稳定可靠的 ETF 复权源）；token 由 TUSHARE_TOKEN 环境变量
-    # 传入（不入代码/git），下面 set_token 显式设——绕开 SDK 层环境变量对代理的干扰。
-    pro._DataApi__http_url = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
+    import requests, time
+    api_url = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
+    def _ts_post(api_name, params, fields):
+        """tushare Pro HTTP POST（服务商文档“方式二”，绕开 SDK 的 lxml 依赖链——
+        本机 termux 装 tushare SDK 卡在 lxml 源码编译、无 cp314 aarch64 wheel，SDK 顶层
+        import 即失败）。token 直接进请求体，不再受 SDK 层环境变量干扰代理的坑影响。"""
+        r = requests.post(api_url, json={"api_name": api_name, "token": token,
+                                         "params": params, "fields": fields},
+                          headers={"Accept-Encoding": "gzip"}, timeout=30)
+        j = r.json()
+        if j.get("code") != 0:
+            raise RuntimeError(f"tushare {api_name} 调用失败: {j.get('msg')}")
+        d = j["data"]
+        return pd.DataFrame(d["items"], columns=d["fields"])
     def tc(c): return c + (".SH" if c[0] in "5" else ".SZ")
     end = pd.Timestamp.today().strftime("%Y%m%d")
     series = {}
     raw_d = {}; pre_d = {}                                 # 未复权（涨跌停判定用，D2）
     for c in ALL_CODES:
-        fd = pro.fund_daily(ts_code=tc(c), start_date="20130101", end_date=end)
+        fd = _ts_post("fund_daily", {"ts_code": tc(c), "start_date": "20130101", "end_date": end},
+                      "trade_date,close,pre_close")
         fd["date"] = pd.to_datetime(fd["trade_date"])
         fd = fd.set_index("date").sort_index()             # fund_daily 返回本就是未复权价
         close = fd["close"].astype(float)                  # 未复权收盘（前复权由下面手动算）
@@ -83,7 +92,7 @@ def _load_via_tushare(with_limits=False):
         pre_d[c] = fd["pre_close"].astype(float) if "pre_close" in fd else close.shift(1)
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
         try:
-            div = pro.fund_div(ts_code=tc(c))
+            div = _ts_post("fund_div", {"ts_code": tc(c)}, "ex_date,div_cash,div_proc")
             divs = sorted([(r["ex_date"], float(r["div_cash"])) for _, r in div.iterrows()
                            if r["div_proc"] == "实施" and pd.notna(r["ex_date"]) and pd.notna(r["div_cash"])],
                           key=lambda x: x[0])
@@ -291,13 +300,23 @@ def bench_nav(px):
 
 # ---------------- 绩效指标 ----------------
 def perf(nav, daily):
-    """根据净值曲线 nav 和日收益 daily 算常用绩效指标。"""
+    """根据净值曲线 nav 和日收益 daily 算常用绩效指标。
+    无风险利率/MAR/Omega 阈值统一按 0（与现有夏普口径一致，便于横向比较）。"""
     years = (nav.index[-1] - nav.index[0]).days / 365.25
     cagr = nav.iloc[-1] ** (1/years) - 1               # 年化收益（几何平均）
     vol = daily.std() * np.sqrt(252)                   # 年化波动
     sharpe = (daily.mean() * 252) / (daily.std() * np.sqrt(252) + 1e-12)  # 夏普（无风险利率按0）
+    # Sortino：分母换成下行偏差（仅惩罚负收益，MAR=0），比夏普更能戳穿"靠几次大涨堆出来的夏普"
+    dd_dev = np.sqrt((daily.clip(upper=0.0) ** 2).mean()) * np.sqrt(252)  # 年化下行偏差
+    sortino = (daily.mean() * 252) / (dd_dev + 1e-12)
     mdd = ((nav / nav.cummax()) - 1).min()             # 最大回撤 = 距历史最高点的最大跌幅
-    return dict(总收益=nav.iloc[-1]-1, 年化=cagr, 波动=vol, 夏普=sharpe, 回撤=mdd, 年数=years)
+    calmar = cagr / (abs(mdd) + 1e-12)                 # Calmar = 年化/|最大回撤|（风险调整回撤）
+    # Omega（阈值0，不年化）：正收益之和/|负收益之和|，>1 即盈利侧占优
+    gains = daily[daily > 0].sum()
+    losses = -daily[daily < 0].sum()
+    omega = gains / (losses + 1e-12)
+    return dict(总收益=nav.iloc[-1]-1, 年化=cagr, 波动=vol, 夏普=sharpe,
+                Sortino=sortino, Calmar=calmar, Omega=omega, 回撤=mdd, 年数=years)
 
 
 def rolling_metrics(daily, window=252):
@@ -312,11 +331,12 @@ def rolling_metrics(daily, window=252):
 
 
 def _print_table(rows):
-    """rows: [(名称, perf字典)]"""
-    print(f"{'策略':<22}{'总收益':>9}{'年化':>8}{'波动':>8}{'最大回撤':>9}{'夏普':>7}")
+    """rows: [(名称, perf字典)]。Sortino/Calmar/Omega 见改进项 F1。"""
+    print(f"{'策略':<22}{'总收益':>9}{'年化':>8}{'波动':>8}{'最大回撤':>9}{'夏普':>7}{'Sortino':>9}{'Calmar':>8}{'Omega':>8}")
     for name, p in rows:
         print(f"{name:<22}{p['总收益']*100:>8.1f}%{p['年化']*100:>7.1f}%"
-              f"{p['波动']*100:>7.1f}%{p['回撤']*100:>8.1f}%{p['夏普']:>7.2f}")
+              f"{p['波动']*100:>7.1f}%{p['回撤']*100:>8.1f}%{p['夏普']:>7.2f}"
+              f"{p['Sortino']:>9.2f}{p['Calmar']:>8.2f}{p['Omega']:>8.2f}")
 
 
 # ---------------- 主流程 ----------------
