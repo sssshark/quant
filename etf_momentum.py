@@ -31,37 +31,87 @@ ALL_CODES = list(POOL) + [DEFENSE[0]]
 
 # ---------------- 数据 ----------------
 def load_real():
-    """akshare 拉真实日线（前复权收盘价），各 ETF 按自身上市日，起点锚定基准+防守。
+    """拉真实前复权日线。优先 tushare（根治 E2），未配置 TUSHARE_TOKEN 则回退东财 akshare（带重试）。
 
-    改进项 E2：每只 ETF 带重试 + 指数退避，应对东财接口临时限频。注意 akshare 内 ETF
-    复权数据仅东财(fund_etf_hist_em)一家可靠——新浪源(fund_etf_hist_sina)不复权、
-    baostock 与股票接口均不支持 ETF，故无等价复权备源；长期根治需引入 tushare 等付费源。"""
-    import akshare as ak
-    import time
-    end_date = pd.Timestamp.today().strftime("%Y%m%d")   # 动态截止日：跑到哪天拉到哪天，不再锁死 2025 年底
+    改进项 E2：tushare 走 fund_daily + fund_div 手动前复权（pro_bar 的 adj 对 ETF 不生效），
+    不限频、复权准确，是唯一稳定可靠的 ETF 复权源。东财 fund_etf_hist_em 复权但限频；
+    新浪 fund_etf_hist_sina 不复权、baostock/股票接口不支持 ETF。"""
+    px = _load_via_tushare()
+    if px is not None:
+        return px
+    return _load_via_eastmoney()
+
+
+def _load_via_tushare():
+    """tushare 前复权（根治 E2）。需环境变量 TUSHARE_TOKEN（必填）、TUSHARE_API（代理 URL，可选，
+    默认官方 api.tushare.pro）。未配置返回 None，由 load_real 回退东财。
+
+    关键：tushare 的 pro_bar(adj='qfq') 对 ETF(asset='FD') 不生效（返回不复权），故用
+    fund_daily(不复权 close) + fund_div(分红 ex_date/div_cash) 手动算前复权：
+    每个除权日之前的价格 × (前收盘-分红)/前收盘，累积即得连续前复权序列。"""
+    import os
+    token = os.environ.get("TUSHARE_TOKEN")
+    if not token:
+        return None
+    import tushare as ts, time
+    ts.set_token(token)
+    pro = ts.pro_api()
+    pro._DataApi__http_url = os.environ.get("TUSHARE_API", "https://api.tushare.pro")
+    def tc(c): return c + (".SH" if c[0] in "5" else ".SZ")
+    end = pd.Timestamp.today().strftime("%Y%m%d")
+    series = {}
+    for c in ALL_CODES:
+        fd = pro.fund_daily(ts_code=tc(c), start_date="20130101", end_date=end)
+        fd["date"] = pd.to_datetime(fd["trade_date"])
+        close = fd.set_index("date")["close"].astype(float).sort_index()
+        time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
+        try:
+            div = pro.fund_div(ts_code=tc(c))
+            divs = sorted([(r["ex_date"], float(r["div_cash"])) for _, r in div.iterrows()
+                           if r["div_proc"] == "实施" and pd.notna(r["ex_date"]) and pd.notna(r["div_cash"])],
+                          key=lambda x: x[0])
+        except Exception:
+            divs = []
+        time.sleep(0.6)
+        adj = close.copy(); adj.name = c
+        for ex_date, dc in divs:                           # 前复权：除权日之前价格 ×(前收盘-分红)/前收盘
+            ex_ts = pd.Timestamp(ex_date); before = close.index[close.index < ex_ts]
+            if len(before) == 0:
+                continue
+            pre = close.loc[before[-1]]
+            if pre <= 0:
+                continue
+            adj.loc[adj.index < ex_ts] *= (pre - dc) / pre
+        series[c] = adj
+    px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
+    ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
+    return px.loc[ready[0]:]
+
+
+def _load_via_eastmoney():
+    """东财 fund_etf_hist_em 前复权，带 4 次重试 + 指数退避（应对东财 IP 限频）。"""
+    import akshare as ak, time
+    end_date = pd.Timestamp.today().strftime("%Y%m%d")
     series = {}
     for c in ALL_CODES:
         df = None
-        for attempt in range(4):                          # 最多重试 4 次，指数退避
+        for attempt in range(4):
             try:
                 df = ak.fund_etf_hist_em(symbol=c, period="daily",
                                          start_date="20140101", end_date=end_date, adjust="qfq")
                 if len(df):
                     break
-                df = None                                  # 空表视为失败
+                df = None
             except Exception as e:
                 if attempt == 3:
                     raise RuntimeError(
-                        f"{c} 拉取失败（东财接口可能限频，请稍后重试或更换网络）: {e}") from e
-            time.sleep(5 * (attempt + 1))                  # 失败退避 5/10/15/20s
-        time.sleep(0.3)                                    # 成功也小间隔，降低触发限频概率
+                        f"{c} 拉取失败（东财限频；建议配置 TUSHARE_TOKEN 走 tushare）: {e}") from e
+            time.sleep(5 * (attempt + 1))
+        time.sleep(0.3)
         df["日期"] = pd.to_datetime(df["日期"])
         series[c] = df.set_index("日期")["收盘"].rename(c)
-    # 各 ETF 上市日不同，按日期外连接成一张宽表（缺失处为 NaN）
     px = pd.concat(series.values(), axis=1).sort_index()
-    px = px.dropna(how="all").ffill()                       # 仅向前填上市后的停牌缺口，上市前仍为 NaN
-    # 起点锚定到“基准 + 防守资产都已上市”之后，保证基准曲线和防守切换全程有效；
-    # 晚上市的标的（如中证1000）在有数据后才会进入动量排序。
+    px = px.dropna(how="all").ffill()
     ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
     return px.loc[ready[0]:]
 
