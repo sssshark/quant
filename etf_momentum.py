@@ -24,6 +24,7 @@ from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
                            VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, SKIP_RECENT,
                            RISK_ADJ, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
+                           DRAWDOWN_PROT, DD_WINDOW, DD_THR, DD_CUT,
                            decide_targets)
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
@@ -121,7 +122,9 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              trend_cut=TREND_CUT, vol_window=VOL_WINDOW, skip_recent=SKIP_RECENT,
              risk_adj=RISK_ADJ, weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
              crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
-             crash_thr=CRASH_THR, crash_cut=CRASH_CUT):
+             crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
+             drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
+             dd_thr=DD_THR, dd_cut=DD_CUT):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     trend_ma:    大盘趋势过滤均线天数（None=关闭），用于对比加/不加趋势择时的效果。
     trend_cut:   趋势下行时股票仓的"保留比例"（透传给 decide_targets，供 robust 扫描）。
@@ -157,7 +160,10 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            inv_vol_window=inv_vol_window,
                                            crash_prot=crash_prot,
                                            crash_lookback=crash_lookback,
-                                           crash_thr=crash_thr, crash_cut=crash_cut)
+                                           crash_thr=crash_thr, crash_cut=crash_cut,
+                                           drawdown_prot=drawdown_prot,
+                                           dd_window=dd_window,
+                                           dd_thr=dd_thr, dd_cut=dd_cut)
             if target:
                 cur = pd.Series(0.0, index=px.columns)
                 for code, w in target.items():

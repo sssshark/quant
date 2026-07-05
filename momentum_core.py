@@ -69,6 +69,15 @@ CRASH_LOOKBACK = 21                       # 检测"暴力反弹"的短期窗口�
 CRASH_THR = 0.10                          # 该窗口涨幅 ≥10% 触发降仓（A 股月涨 10% 属急涨）
 CRASH_CUT = 0.5                           # 触发时股票仓保留比例（0.5=砍半挪国债）
 
+# ---- 回撤控制（改进项 C2）----
+# 波动率目标的盲区是"慢刀阴跌"（低波动但持续下跌，vol_target 不触发）。用大盘（风向标）
+# 距近 DD_WINDOW 日高点的累积跌幅捕捉：回撤 ≤ DD_THR 时降股票仓挪国债。与 trend filter
+# 同源（都用大盘）但信号不同——trend 看长期均线方向，drawdown 看累积跌幅深度。
+DRAWDOWN_PROT = False                     # 默认关（向后兼容）；改 True 开启
+DD_WINDOW = 126                           # 回撤计算窗口（约半年）
+DD_THR = -0.10                            # 大盘距窗口高点跌幅 ≤ -10% 触发（深跌=慢刀阴跌累积）
+DD_CUT = 0.5                              # 触发时股票仓保留比例（0.5=砍半挪国债）
+
 
 def _is_num(x):
     """是否为有效数字（排除 None 和 NaN）——价格序列里可能混入缺失值。"""
@@ -174,7 +183,9 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    trend_cut=TREND_CUT, skip_recent=SKIP_RECENT, risk_adj=RISK_ADJ,
                    weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
                    crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
-                   crash_thr=CRASH_THR, crash_cut=CRASH_CUT):
+                   crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
+                   drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
+                   dd_thr=DD_THR, dd_cut=DD_CUT):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -268,5 +279,19 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                 for c in [c for c in target if c != dcode]:
                     moved = target[c] * (1 - crash_cut)
                     target[c] *= crash_cut
+                    target[dcode] = target.get(dcode, 0.0) + moved
+
+    # === 第六步：回撤控制（改进项 C2）。大盘距近期高点深跌 → 降仓挪国债 ===
+    #     波动率目标的盲区是"慢刀阴跌"（低波动但持续下跌）。用风向标近 dd_window 日
+    #     高点衡量累积跌幅，回撤 ≤ dd_thr 时按 dd_cut 降股票仓。与 trend filter 同源
+    #     （都用大盘）但信号不同：trend 看长期均线方向，drawdown 看累积跌幅深度。
+    if drawdown_prot:
+        arr = recent_closes.get(trend_code)
+        if arr and len(arr) > dd_window:
+            peak = max(arr[-dd_window:]); now = arr[-1]
+            if _is_num(peak) and _is_num(now) and peak > 0 and (now - peak) / peak <= dd_thr:
+                for c in [c for c in target if c != dcode]:
+                    moved = target[c] * (1 - dd_cut)
+                    target[c] *= dd_cut
                     target[dcode] = target.get(dcode, 0.0) + moved
     return target, picks
