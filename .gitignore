@@ -11,3 +11,6 @@ last_rebalance.txt
 
 # 回测产出的图（可由 etf_momentum.py 重新生成）
 ETF动量轮动_回测结果.png
+
+# tushare 凭证（本地持有，不入仓库；_load_via_tushare 在环境变量缺失时回退读它）
+.tushare_token

@@ -25,46 +25,62 @@ from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
                            RISK_ADJ, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
                            DRAWDOWN_PROT, DD_WINDOW, DD_THR, DD_CUT,
-                           decide_targets)
+                           _limit, decide_targets)
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
 
 
 # ---------------- 数据 ----------------
-def load_real():
+def load_real(with_limits=False):
     """拉真实前复权日线。优先 tushare（根治 E2），未配置 TUSHARE_TOKEN 则回退东财 akshare（带重试）。
 
     改进项 E2：tushare 走 fund_daily + fund_div 手动前复权（pro_bar 的 adj 对 ETF 不生效），
     不限频、复权准确，是唯一稳定可靠的 ETF 复权源。东财 fund_etf_hist_em 复权但限频；
-    新浪 fund_etf_hist_sina 不复权、baostock/股票接口不支持 ETF。"""
-    px = _load_via_tushare()
-    if px is not None:
-        return px
-    return _load_via_eastmoney()
+    新浪 fund_etf_hist_sina 不复权、baostock/股票接口不支持 ETF。
+    改进项 D2：with_limits=True 时额外返回 (cant_buy, cant_sell) 涨跌停掩码（收盘封板→
+    对应方向无法成交）。掩码用未复权真实价算（前复权会扭曲涨跌幅）；未配置时返回纯 px（向后兼容）。"""
+    res = _load_via_tushare(with_limits)
+    if res is not None:
+        return res
+    return _load_via_eastmoney(with_limits)
 
 
-def _load_via_tushare():
-    """tushare 前复权（根治 E2）。需环境变量 TUSHARE_TOKEN（必填）、TUSHARE_API（代理 URL，可选，
-    默认官方 api.tushare.pro）。未配置返回 None，由 load_real 回退东财。
+def _load_via_tushare(with_limits=False):
+    """tushare 前复权（根治 E2）。代理 URL 由 TUSHARE_API 环境变量指定（可选，
+    默认代理 fastapic.stockai888.top）。token 优先 TUSHARE_TOKEN 环境变量，其次本地
+    .tushare_token 文件（gitignore，不入库，方便不设环境变量直接跑）；两者都无返回 None。
 
     关键：tushare 的 pro_bar(adj='qfq') 对 ETF(asset='FD') 不生效（返回不复权），故用
     fund_daily(不复权 close) + fund_div(分红 ex_date/div_cash) 手动算前复权：
-    每个除权日之前的价格 × (前收盘-分红)/前收盘，累积即得连续前复权序列。"""
+    每个除权日之前的价格 × (前收盘-分红)/前收盘，累积即得连续前复权序列。
+    D2：with_limits=True 时额外用未复权 close/pre_close 算涨跌停掩码（fund_daily 本就不复权，
+    pre_close 列直接可用，判定最准）。"""
     import os
     token = os.environ.get("TUSHARE_TOKEN")
+    if not token:
+        # 回退本地 .tushare_token 文件（gitignore，不入库；方便不设环境变量直接跑）
+        _tf = os.path.join(os.path.dirname(__file__), ".tushare_token")
+        if os.path.exists(_tf):
+            token = open(_tf, encoding="utf-8").read().strip()
     if not token:
         return None
     import tushare as ts, time
     ts.set_token(token)
     pro = ts.pro_api()
-    pro._DataApi__http_url = os.environ.get("TUSHARE_API", "https://api.tushare.pro")
+    # 默认走 stockai888 代理（本项目稳定可靠的 ETF 复权源）；token 由 TUSHARE_TOKEN 环境变量
+    # 传入（不入代码/git），下面 set_token 显式设——绕开 SDK 层环境变量对代理的干扰。
+    pro._DataApi__http_url = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
     def tc(c): return c + (".SH" if c[0] in "5" else ".SZ")
     end = pd.Timestamp.today().strftime("%Y%m%d")
     series = {}
+    raw_d = {}; pre_d = {}                                 # 未复权（涨跌停判定用，D2）
     for c in ALL_CODES:
         fd = pro.fund_daily(ts_code=tc(c), start_date="20130101", end_date=end)
         fd["date"] = pd.to_datetime(fd["trade_date"])
-        close = fd.set_index("date")["close"].astype(float).sort_index()
+        fd = fd.set_index("date").sort_index()             # fund_daily 返回本就是未复权价
+        close = fd["close"].astype(float)                  # 未复权收盘（前复权由下面手动算）
+        raw_d[c] = close
+        pre_d[c] = fd["pre_close"].astype(float) if "pre_close" in fd else close.shift(1)
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
         try:
             div = pro.fund_div(ts_code=tc(c))
@@ -86,11 +102,23 @@ def _load_via_tushare():
         series[c] = adj
     px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
     ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
-    return px.loc[ready[0]:]
+    px = px.loc[ready[0]:]
+    if with_limits:
+        raw = pd.concat(raw_d, axis=1).sort_index().ffill()
+        pc = pd.concat(pre_d, axis=1).sort_index().ffill()
+        raw = raw.reindex(px.index)[px.columns]            # 对齐到 px 的索引/列（同源，reindex 不引入 NaN）
+        pc = pc.reindex(px.index)[px.columns]
+        cb, cs = limit_masks(raw, pc)
+        return px, cb.fillna(False), cs.fillna(False)
+    return px
 
 
-def _load_via_eastmoney():
-    """东财 fund_etf_hist_em 前复权，带 4 次重试 + 指数退避（应对东财 IP 限频）。"""
+def _load_via_eastmoney(with_limits=False):
+    """东财 fund_etf_hist_em 前复权，带 4 次重试 + 指数退避（应对东财 IP 限频）。
+
+    D2：with_limits=True 时用复权收盘环比近似涨跌停（akshare 回退路径，再拉一次 adjust=""
+    会翻倍调用、东财本就限频不划算）。除权日复权因子会扭曲单日环比、可能误判封板，
+    但 ETF 除权日极少、影响单日单标的，回测整体可忽略。主力走 tushare 即无此问题。"""
     import akshare as ak, time
     end_date = pd.Timestamp.today().strftime("%Y%m%d")
     series = {}
@@ -110,11 +138,68 @@ def _load_via_eastmoney():
             time.sleep(5 * (attempt + 1))
         time.sleep(0.3)
         df["日期"] = pd.to_datetime(df["日期"])
-        series[c] = df.set_index("日期")["收盘"].rename(c)
+        series[c] = df.set_index("日期")["收盘"].astype(float).rename(c)
     px = pd.concat(series.values(), axis=1).sort_index()
     px = px.dropna(how="all").ffill()
     ready = px.index[px[[BENCH, DEFENSE[0]]].notna().all(axis=1)]
-    return px.loc[ready[0]:]
+    px = px.loc[ready[0]:]
+    if with_limits:
+        cb, cs = limit_masks(px.copy(), px.shift(1))      # 复权环比近似
+        return px, cb.fillna(False), cs.fillna(False)
+    return px
+
+
+# ---------------- 涨跌停掩码（D2，向量化专用） ----------------
+def limit_masks(raw_close, raw_pre_close):
+    """用未复权真实价算"收盘封板"掩码（改进项 D2，向量化回测专用）。
+
+    raw_close / raw_pre_close：同形状 DataFrame[date, code]，未复权真实价。
+    返回 (cant_buy, cant_sell)：bool DataFrame，True = 当日该标的收盘封涨停/跌停，
+    对应方向无法成交。涨停价 = round(pre_close*(1+limit), 2)（A 股按分取整）；
+    close ≥ 涨停价 → 收盘封死 → 买不进；close ≤ 跌停价 → 卖不出。
+    用 close 而非 high==low：ETF 封板通常尾盘仍封着，close==板价是"收盘封死"的合理代理；
+    盘中封板尾盘开板（close 未触板）则视作能成交。"""
+    cant_buy = pd.DataFrame(False, index=raw_close.index, columns=raw_close.columns)
+    cant_sell = pd.DataFrame(False, index=raw_close.index, columns=raw_close.columns)
+    for code in raw_close.columns:
+        lim = _limit(code)
+        pc = raw_pre_close[code]
+        cl = raw_close[code]
+        cant_buy[code] = cl >= (pc * (1 + lim)).round(2)
+        cant_sell[code] = cl <= (pc * (1 - lim)).round(2)
+    return cant_buy, cant_sell
+
+
+def _hit(code, day, mask):
+    """mask 在 [day, code] 处是否 True；mask 为 None 或索引/列缺失一律视作 False（保守=能成交）。"""
+    if mask is None:
+        return False
+    try:
+        return bool(mask.loc[day, code])
+    except (KeyError, IndexError):
+        return False
+
+
+def _apply_target_with_limits(tgt_dict, prev_cur, fill_day, cant_buy, cant_sell):
+    """把目标权重 tgt_dict 在成交日 fill_day 落地为实际持仓 Series，按当日涨跌停过滤（D2）。
+
+    返回新的持仓 Series。规则：
+      - 不在 target 的旧仓：默认清零；当日封跌停（卖不出）则维持。
+      - target 中要加仓/新建（w>old）且当日封涨停 → 买不进，维持 old。
+      - target 中要减仓（w<old）且当日封跌停 → 卖不出，维持 old。
+    被过滤滞留的权重自然落到现金（1 - Σ持仓），向量化框架里现金无收益列 = 0 收益。"""
+    new_cur = prev_cur.copy()                       # 先默认维持现状，再按目标/封板调整
+    for c in [c for c in new_cur.index if new_cur[c] > 1e-12 and c not in tgt_dict]:
+        if not _hit(c, fill_day, cant_sell):        # 没封跌停才清得掉
+            new_cur[c] = 0.0
+    for c, w in tgt_dict.items():
+        old = float(prev_cur.get(c, 0.0))
+        if w > old + 1e-9 and _hit(c, fill_day, cant_buy):
+            continue                                # 涨停买不进，维持 old（new_cur[c] 已是 old）
+        if w < old - 1e-9 and _hit(c, fill_day, cant_sell):
+            continue                                # 跌停卖不出，维持 old
+        new_cur[c] = w
+    return new_cur
 
 
 # ---------------- 回测引擎（调用核心大脑） ----------------
@@ -124,8 +209,14 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
              crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
-             dd_thr=DD_THR, dd_cut=DD_CUT):
+             dd_thr=DD_THR, dd_cut=DD_CUT,
+             cant_buy=None, cant_sell=None):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
+    成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
+        的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
+    涨跌停（D2）：cant_buy/cant_sell 为 load_real(with_limits=True) 返回的"收盘封板"掩码
+        （True=当日该标的封涨停/跌停，对应方向无法成交，维持原仓）。None=不限制（向后兼容，
+        sweep/robust/wf 等保持原行为）。
     trend_ma:    大盘趋势过滤均线天数（None=关闭），用于对比加/不加趋势择时的效果。
     trend_cut:   趋势下行时股票仓的"保留比例"（透传给 decide_targets，供 robust 扫描）。
     vol_target:  年化波动目标（None=关闭）；vol_window: 估计近期波动的回看窗口。
@@ -144,12 +235,18 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
     rebal_days = [d for d in rebal_days if d >= px.index[need]]
     rd_set = set(rebal_days)
 
-    # 2) 逐日推进，构造一张“每天持有什么权重”的表。非调仓日沿用上次权重（cur 不变）
+    # 2) 逐日推进，构造一张“每天持有什么权重”的表。D1：信号日(T)算目标→pending，次日(T+1，
+    #    成交日)才落地为 cur（防未来函数/收盘瞬时成交偏误）；D2：落地时按成交日涨跌停过滤。
     weights = pd.DataFrame(0.0, index=px.index, columns=px.columns)
-    cur = pd.Series(0.0, index=px.columns)                  # 当前持仓权重，跨日延续
+    cur = pd.Series(0.0, index=px.columns)                  # 当前实际持仓权重（已含涨跌停过滤）
     holdings_log = []
+    pending = None                                          # (target_dict, picks) 信号日算出、待次日成交
     for d in px.index:
-        if d in rd_set:                                    # 到调仓日才重新决策
+        if pending is not None:                            # 今日 = 上一调仓日的成交日(T+1)：落地 pending
+            tgt_dict, picks = pending
+            cur = _apply_target_with_limits(tgt_dict, cur, d, cant_buy, cant_sell)
+            pending = None
+        if d in rd_set:                                    # 今日 = 信号日(T)：算信号，延迟到次日成交
             # 把截至当日的收盘价喂给核心大脑（与实盘喂法一致）
             recent = {c: px[c].loc[:d].dropna().tolist() for c in POOL}
             target, picks = decide_targets(recent, lookbacks=lookbacks,
@@ -165,9 +262,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            dd_window=dd_window,
                                            dd_thr=dd_thr, dd_cut=dd_cut)
             if target:
-                cur = pd.Series(0.0, index=px.columns)
-                for code, w in target.items():
-                    cur[code] += w                         # 写入新目标权重
+                pending = (target, picks)                  # 不立即写 cur，等下一日成交
                 holdings_log.append((d.date(), picks))
         weights.loc[d] = cur.values
 
@@ -503,11 +598,62 @@ def run_universe(px, drop=("518880", "513100")):
           f"说明动量逻辑本身有 alpha，不是纯靠池子。")
 
 
+def run_review():
+    """D1/D2 改完后，在新口径（T+1 成交 + 涨跌停）下复核 C1/C2 的旧结论是否仍成立。
+
+    旧结论（coc 口径）：C2 单独有效但全风控下与 vol_target+trend 重叠（边际≈0）；
+    C1 inv_vol 无可靠夏普提升、不稳健。新口径若改变这两个结论，需重新评估默认开关。"""
+    px, cant_buy, cant_sell = load_real(with_limits=True)
+    lim = dict(cant_buy=cant_buy, cant_sell=cant_sell)
+
+    print("=" * 64)
+    print("C2 回撤控制复核（全风控下 开/关）— 新口径 T+1 + 涨跌停")
+    print("=" * 64)
+    base = dict(vol_target=VOL_TARGET, trend_ma=TREND_MA, trend_cut=TREND_CUT)
+    nav_on, ret_on, _, _ = backtest(px, **base, **lim, drawdown_prot=True,
+                                     dd_window=DD_WINDOW, dd_thr=DD_THR, dd_cut=DD_CUT)
+    nav_off, ret_off, _, _ = backtest(px, **base, **lim, drawdown_prot=False)
+    p_on, p_off = perf(nav_on, ret_on), perf(nav_off, ret_off)
+    _print_table([("全风控 + C2关", p_off), ("全风控 + C2开", p_on)])
+    d_sh = p_on["夏普"] - p_off["夏普"]
+    print(f"  夏普 {p_off['夏普']:.2f}→{p_on['夏普']:.2f} ({d_sh:+.2f})  "
+          f"回撤 {p_off['回撤']*100:.1f}%→{p_on['回撤']*100:.1f}%  "
+          f"年化 {p_off['年化']*100:.1f}%→{p_on['年化']*100:.1f}%")
+    print(f"  → {'边际≈0、与全风控重叠，保持默认关（与旧结论一致）' if abs(d_sh) < 0.03 else '新口径下有显著差异，需重新评估'}")
+
+    print("\n" + "=" * 64)
+    print("C1 反向波动加权复核（vol_target × weighting）— 新口径")
+    print("=" * 64)
+    print(f"{'vol_target':<12}{'equal夏普':>10}{'inv_vol夏普':>12}{'Δ夏普':>8}"
+          f"{'equal回撤':>11}{'inv_vol回撤':>12}")
+    better = 0; total = 0
+    for vt in (None, 0.10, 0.15):
+        nav_eq, ret_eq, _, _ = backtest(px, vol_target=vt, trend_ma=TREND_MA, **lim, weighting="equal")
+        nav_iv, ret_iv, _, _ = backtest(px, vol_target=vt, trend_ma=TREND_MA, **lim,
+                                         weighting="inv_vol", inv_vol_window=INV_VOL_WINDOW)
+        pe, pi = perf(nav_eq, ret_eq), perf(nav_iv, ret_iv)
+        d = pi["夏普"] - pe["夏普"]
+        print(f"{str(vt):<12}{pe['夏普']:>10.2f}{pi['夏普']:>12.2f}{d:>+8.2f}"
+              f"{pe['回撤']*100:>10.1f}%{pi['回撤']*100:>11.1f}%")
+        better += (d >= 0); total += 1
+    print(f"\n  inv_vol 夏普≥等权: {better}/{total}")
+    print(f"  → {'不稳健（与旧结论一致），保持默认 equal' if better < total else '新口径下 inv_vol 普遍占优，可考虑启用'}")
+
+
 def main():
     # 读命令行参数决定运行模式：传 "sweep" 走参数扫描，不传则默认 "real" 跑回测出图。
     # sys.argv[0] 是脚本名，argv[1] 才是用户传的第一个参数，故需先判断长度防越界。
     mode = sys.argv[1] if len(sys.argv) > 1 else "real"
-    px = load_real()
+    if mode == "review":
+        run_review()
+        return
+    # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
+    # real 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图与复核用。
+    loaded = load_real(with_limits=(mode == "real"))
+    if mode == "real":
+        px, cant_buy, cant_sell = loaded
+    else:
+        px, cant_buy, cant_sell = loaded, None, None
 
     if mode == "sweep":
         run_sweep(px)
@@ -526,12 +672,13 @@ def main():
         run_universe(px)
         return
 
-    # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准
-    nav_base, ret_base, _, _ = backtest(px, vol_target=None)
-    nav_vt, ret_vt, n_vt, _ = backtest(px, vol_target=VOL_TARGET)
-    nav_tr, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)              # 等权（默认）
+    # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准（real 模式带 D1/D2 新口径）
+    lim = dict(cant_buy=cant_buy, cant_sell=cant_sell)
+    nav_base, ret_base, _, _ = backtest(px, vol_target=None, **lim)
+    nav_vt, ret_vt, n_vt, _ = backtest(px, vol_target=VOL_TARGET, **lim)
+    nav_tr, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, **lim)        # 等权（默认）
     nav_iv, ret_iv, _, log = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA,
-                                      weighting="inv_vol")                                      # C1 反向波动
+                                      weighting="inv_vol", **lim)                               # C1 反向波动
     bn = bench_nav(px)
 
     p_base, p_vt = perf(nav_base, ret_base), perf(nav_vt, ret_vt)

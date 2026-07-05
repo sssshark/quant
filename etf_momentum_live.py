@@ -23,7 +23,7 @@ import sys
 import datetime as dt
 
 from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
-                           TREND_MA, decide_targets)
+                           TREND_MA, _limit, decide_targets)
 
 # 取数长度要同时够"动量回看"和"大盘趋势均线"两者，取较大值（趋势用 200 日均线 > 126）
 HISTORY_BARS = max(MAX_LOOKBACK, TREND_MA)
@@ -118,12 +118,17 @@ def _market(code):
     return code + (".SH" if code[0] in "51" else ".SZ")
 
 
-def build_orders(target, recent, total, positions, band=REBALANCE_BAND):
+def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
+                 cant_buy_today=None, cant_sell_today=None):
     """
     对比目标权重与当前持仓，生成 [(code, 'BUY'/'SELL', 股数), ...]，先卖后买。
     再平衡阈值 band：对“调仓前后都持有、仅小幅漂移”的标的设静默区，偏离金额
     不足 band×总资产就不动，避免无谓换手；换信号（清仓/新建仓）照常执行。
+    D2：cant_buy_today/cant_sell_today 是当日收盘封涨停/跌停的 code 集合——封板方向
+    无法成交（券商本也会拒单），直接跳过该单、维持原仓，省无效挂单。
     """
+    cant_buy_today = cant_buy_today or set()
+    cant_sell_today = cant_sell_today or set()
     price = {c: arr[-1] for c, arr in recent.items()}   # 各标的现价 = 序列最后一个收盘
     # 目标股数 = 目标市值 / 现价，再向下取整到整百股。
     # 写法解析：total*w/px 是理论股数；// LOT 整除得“多少个100股”；再 *LOT 还原成股数。
@@ -147,8 +152,12 @@ def build_orders(target, recent, total, positions, band=REBALANCE_BAND):
             if px and abs(tgt - held) * px < band * total:
                 continue
         if tgt < held:
+            if code in cant_sell_today:                 # D2：跌停卖不出，跳过留仓
+                continue
             sells.append((code, "SELL", held - tgt))   # 目标比持有少 → 卖差额
         else:
+            if code in cant_buy_today:                  # D2：涨停买不进，跳过
+                continue
             buys.append((code, "BUY", tgt - held))      # 目标比持有多 → 买差额
     return sells + buys                     # 列表相加 = 先卖单后买单，保证先回笼现金
 
@@ -230,11 +239,26 @@ def main():
         return
     print("目标权重:", {c: round(w, 3) for c, w in target.items()})
 
+    # D2：当日收盘封板的标的，对应方向无法成交（券商本也会拒单，这里提前省无效挂单）。
+    #     实盘月末收盘后运行，recent 最后一个收盘即今日收盘，用环比近似涨跌停。
+    cant_buy_today, cant_sell_today = set(), set()
+    for c, arr in recent.items():
+        if len(arr) >= 2 and arr[-2] > 0:
+            lim = _limit(c)
+            pct = arr[-1] / arr[-2] - 1.0
+            if pct >= lim - 1e-4:
+                cant_buy_today.add(c)
+            elif pct <= -lim + 1e-4:
+                cant_sell_today.add(c)
+    if cant_buy_today or cant_sell_today:
+        print(f"[D2] 当日封板：涨停买不进 {cant_buy_today or '无'} / 跌停卖不出 {cant_sell_today or '无'}（跳过对应单）")
+
     ctx = connect_trader()
     total, positions = read_account(ctx, price)
     print(f"账户总资产: {total:,.0f}  当前持仓: {positions or '无'}")
 
-    orders = build_orders(target, recent, total, positions)
+    orders = build_orders(target, recent, total, positions,
+                          cant_buy_today=cant_buy_today, cant_sell_today=cant_sell_today)
     if not orders:
         print("已与目标一致，无需调仓。")
         mark_done_this_month()

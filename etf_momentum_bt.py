@@ -18,7 +18,7 @@ import backtrader as bt
 
 # 策略参数与“选股大脑”统一从核心模块导入，回测/实盘共用一份逻辑
 from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK,
-                           COMMISSION, SLIPPAGE, BENCH, TREND_MA, decide_targets)
+                           COMMISSION, SLIPPAGE, BENCH, TREND_MA, _limit, decide_targets)
 
 START_CASH = 1_000_000
 # 喂给决策大脑的历史长度要同时够"动量回看"和"大盘趋势均线"两者，取较大值。
@@ -92,6 +92,19 @@ class MomentumRotation(bt.Strategy):
                 out[d._name] = [d.close[-i] for i in range(k, -1, -1)]
         return out
 
+    def _at_limit(self, d):
+        """当日 d 是否收盘封涨停/跌停（复权 close 环比近似）。返回 (up, down)。
+        BT 拿不到 next bar 数据，成交虽在 T+1 但用 T 日近似判定——与向量化版精确 T+1 判定
+        有 1 bar 差异，BT 仅作慢速粗对照。除权日复权因子会扭曲环比，ETF 除权日极少可接受。"""
+        if len(d) < 2:
+            return False, False
+        lim = _limit(d._name)
+        prev = d.close[-1]
+        if not prev:
+            return False, False
+        pct = d.close[0] / prev - 1.0
+        return pct >= lim - 1e-4, pct <= -lim + 1e-4
+
     def next(self):
         # next() 每根 bar（每个交易日）被调用一次；datetime.date(0) 是“当前这根”的日期。
         dt = self.datas[0].datetime.date(0)
@@ -112,16 +125,20 @@ class MomentumRotation(bt.Strategy):
             return
         self.holdings_log.append((dt, names))
 
-        # 调仓分两轮，先卖后买：
-        # 第一轮：把“目标里不再持有、但当前还有仓”的标的清掉（target=0 即全部卖出）
+        # 调仓分两轮，先卖后买（D2：封板方向跳过——涨停买不进、跌停卖不出，维持原仓）：
+        # 第一轮：把“目标里不再持有、但当前还有仓”的标的清掉（封跌停卖不出则保留）
         for d in self.datas:
             if target.get(d._name, 0.0) == 0.0 and self.getposition(d).size != 0:
-                self.order_target_percent(d, target=0.0)
-        # 第二轮：对目标里要持有的，按目标权重下单（order_target_percent 会自动算该买/卖多少股）
+                _, dn = self._at_limit(d)
+                if not dn:
+                    self.order_target_percent(d, target=0.0)
+        # 第二轮：对目标里要持有的，按目标权重下单（封涨停买不进则跳过）
         for d in self.datas:
             tgt = target.get(d._name, 0.0)
             if tgt > 0.0:
-                self.order_target_percent(d, target=tgt)
+                up, _ = self._at_limit(d)
+                if not up:
+                    self.order_target_percent(d, target=tgt)
 
 # ---------------- 运行 ----------------
 def add_feeds(cerebro, data: dict):
@@ -149,9 +166,10 @@ def run_strategy(data):
     cerebro.broker.setcash(START_CASH)          # 设初始资金
     cerebro.broker.setcommission(commission=COMMISSION)   # 设手续费率
     cerebro.broker.set_slippage_perc(perc=SLIPPAGE)       # 设滑点率
-    # cheat-on-close：调仓单按当根收盘价成交，先卖后买在同一根 bar 内顺序结算，
-    # 卖出现金立即可用于买入，避免“卖出未到账→买单因现金不足被拒”的欠仓问题。
-    cerebro.broker.set_coc(True)
+    # D1：不用 cheat-on-close——订单在下一根 bar 开盘成交（月末 T 日信号 → T+1 成交），
+    #     与向量化版 T+1 口径对齐（向量化按 T+1 收盘，BT 按 T+1 开盘，差半天，可接受）。
+    #     先卖后买在同一执行 bar 内顺序撮合，卖出回笼现金立即可用于买入。
+    #     原 set_coc(True) 已停用：它让订单按当日收盘成交 = “收盘价信号+收盘价成交”的乐观口径。
     # 挂 analyzer（分析器）：引擎跑完后能取出对应指标。_name 是取结果时用的键。
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")          # 回撤
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe",   # 夏普

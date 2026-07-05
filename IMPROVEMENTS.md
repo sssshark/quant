@@ -22,8 +22,8 @@
 ## 进度
 
 ```
-总 67  ┃ 已完成 5  ┃ 待办 62        已完成: C1, F2, F6, E2, C2
-[高] 13 ┃ [中] 31   ┃ [低] 20
+总 67  ┃ 已完成 7  ┃ 待办 60        已完成: C1, F2, F6, E2, C2, D1, D2
+[高] 11 ┃ [中] 31   ┃ [低] 20
 ```
 （每完成一批,更新上面三组数字)
 
@@ -78,8 +78,8 @@
 
 ## D. 调仓与执行
 
-- [ ] **[高] D1** BT 版 cheat-on-close 偏乐观 — 位置:`etf_momentum_bt.py` L141 `set_coc(True)` — 向量化版用 `shift(1)` 更严谨,两版口径不一致,应统一
-- [ ] **[高] D2** 涨跌停日未处理 — 位置:全局回测/下单 — 涨跌停无法成交,回测假设能成交,A 股影响不小
+- [x] **[高] D1** 统一成交口径到 T+1 — **已实现**。核实发现 BT `set_coc` 与向量化 `shift(1)` **本质等价**(都是"月末当日收盘成交",原"shift(1) 更严谨"为误判)。两版统一升级到 **T+1 成交**(信号 T 日收盘 → 次日成交):向量化 `backtest` 加 pending 缓冲延迟写 weights、BT 删 `set_coc`(默认 next-bar 开盘成交)。消除"收盘价信号+收盘价成交"的乐观偏误。时序自检 6 项全过(见解决记录)
+- [x] **[高] D2** 涨跌停处理 — **已实现(三处)**。共用 `_limit`/`limit_masks`(momentum_core:159915±20%、其余±10%)用未复权真实价算"收盘封板":向量化 `backtest` 加 `cant_buy/cant_sell` 掩码在成交日(T+1)过滤、BT `next` 加 `_at_limit` 下单前跳过、实盘 `build_orders` 加当日封板过滤。封板方向维持原仓、滞留权重落现金。tushare 路径用 fund_daily 的 pre_close 精确判定,akshare 回退用复权环比近似
 - [ ] **[中] D3** 滑点固定 5bp,未按流动性动态 — 位置:`SLIPPAGE` L43 — 创业板/1000 真实冲击成本更高
 - [ ] **[中] D4** `paper_broker` 同步全成 — 位置:`paper_broker.py` L51 `order` — 无部分成交/拒单/断连模拟,实盘鲁棒性未验证
 - [ ] **[中] D5** 整手向下取整 — 位置:`etf_momentum_live.py` L134 `// LOT` — 小幅欠仓长期累积,可用"四舍五入 + 现金兜底"
@@ -147,6 +147,9 @@
 | 2026-07-04 | C1 | `decide_targets` 加 `weighting="inv_vol"`（权重∝1/σ，默认仍 equal）+ `INV_VOL_WINDOW=63` | 12 年真实数据 main A/B + 纯 Python 单元测试 | 夏普 1.21→1.23、回撤 -19.9%→-18.3%、波动 13.2%→12.6%，年化 -0.5pp。边际有效（主降回撤），疑与 vol_target 重叠 → 待配合 C3 / 关 vol_target 验证独立价值 |
 | 2026-07-04 | F2 | 新增 `rolling_metrics()`（滚动年化夏普/波动）+ main 三子图 | main 滚动指标摘要 | 反向波动滚动夏普 均值 0.96/最差 -1.64/>0 占比 84%，优于等权 0.92/-1.72/81% |
 | 2026-07-04 | F6 | 三子图加水下曲线（underwater drawdown） | main 画图 | 已加（与 F2 同图），等权 vs 反向波动回撤对比可视化 |
+| 2026-07-05 | D1 | 统一成交口径到 T+1：核实 BT coc 与向量化 shift(1) 等价（同"月末当日收盘成交"），两版升级为"信号 T 日收盘→次日成交"；向量化 backtest 加 pending 延迟写 weights、BT 删 set_coc | 纯构造数据时序自检 6 项（全封涨停→空仓、按成交日而非信号日判定、跌停维持旧仓、limit_masks 分档、空mask==None 向后兼容）+ 语法检查 | 自检全过；真实数据净值复核待用户跑 `python etf_momentum.py`（本机数据源不可达：东财封代理 IP、tushare 无 token） |
+| 2026-07-05 | D2 | 涨跌停三处过滤：`_limit`/`limit_masks`（未复权真实价，159915±20%/其余±10%）；向量化 cant_buy/cant_sell 掩码、BT `_at_limit`、实盘 build_orders 当日封板 | limit_masks 单元（分档正确）+ _apply_target_with_limits 单元（按成交日判定、封板方向维持旧仓）+ 全封涨停端到端（→空仓） | 自检全过；tushare 精确/akshare 近似 |
+| 2026-07-05 | C1/C2 | D1/D2 新口径（T+1 成交 + 涨跌停）下复核 C1/C2 旧结论 | run_review（tushare，2013-03~2026-07 共 3225 日 / 8 只 ETF） | **结论与旧口径一致**：C2 全风控开/关 Δ夏普 +0.02、回撤 -24.8%→-23.7%（边际≈0、重叠，保持默认关）；C1 inv_vol 在 None/0.10/0.15 vol_target 下夏普 0/3 优于 equal（全输），保持默认 equal。**口径修正不改策略决策** |
 
 > 注：C1 参数网格稳健性（mini-robust，Part2/3）因 akshare/东财接口限频未跑完；数据缓存 + 重试机制已就位（`tmp/px_cache.pkl`），接口冷却后可一键补跑。
 
