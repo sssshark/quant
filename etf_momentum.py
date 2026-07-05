@@ -248,7 +248,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
              dd_thr=DD_THR, dd_cut=DD_CUT,
-             cant_buy=None, cant_sell=None):
+             cant_buy=None, cant_sell=None, defense_cash=None):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
         的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
@@ -299,7 +299,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            crash_thr=crash_thr, crash_cut=crash_cut,
                                            drawdown_prot=drawdown_prot,
                                            dd_window=dd_window,
-                                           dd_thr=dd_thr, dd_cut=dd_cut)
+                                           dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash)
             if target:
                 pending = (target, picks)                  # 不立即写 cur，等下一日成交
                 holdings_log.append((d.date(), picks))

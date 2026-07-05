@@ -217,7 +217,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
                    crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
                    drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
-                   dd_thr=DD_THR, dd_cut=DD_CUT):
+                   dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -255,6 +255,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
 
     target, picks = {}, []
     dcode = DEFENSE[0]
+    dcode_cash = defense_cash or dcode   # B2 分档:动量≤0 / vol_target 挪货基(defense_cash),无则=国债
     # 入选标的的目标权重 weights[code]：
     #   equal  : 每只 cash_buffer/top_n（原行为，向后兼容）
     #   inv_vol: 权重 ∝ 1/σ_i 后归一化到 cash_buffer（改进项 C1）。任一只波动数据不足
@@ -276,7 +277,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
             target[code] = target.get(code, 0.0) + w
             picks.append(POOL[code])
         else:                                                   # 动量≤0 → 这一份切防守资产（国债）
-            target[dcode] = target.get(dcode, 0.0) + w
+            target[dcode_cash] = target.get(dcode_cash, 0.0) + w
             picks.append(DEFENSE[1])
 
     # === 第三步：波动率目标。组合近期波动超标 → 整体缩股票仓，缩出来的挪进防守资产 ===
@@ -288,7 +289,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
             for c in eq_codes:
                 moved = target[c] * (1 - scale)    # 缩掉的那部分权重
                 target[c] *= scale
-                target[dcode] = target.get(dcode, 0.0) + moved  # 转入国债
+                target[dcode_cash] = target.get(dcode_cash, 0.0) + moved  # B2 分档→货基
 
     # === 第四步：大盘趋势过滤。风向标跌破长期均线 → 再整体缩股票仓，挪进防守资产 ===
     #     与波动率目标是两套独立的"减仓"机制，可叠加：波动目标管"波动太大"，
