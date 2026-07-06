@@ -58,6 +58,28 @@ def test_reconcile():
     assert m_bad > 0.10
 
 
+def test_load_hold_all():
+    """J2 落地:live_config.json 的 hold_all 覆盖默认。临时写配置文件、跑完删,验证三级回退。"""
+    import json, tempfile, crossmarket as cm  # noqa: F401 (cm 仅触发其 import 链)
+    cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_config.json")
+    existed = os.path.exists(cfg)
+    saved = open(cfg).read() if existed else None
+    try:
+        for val, want in ((True, True), (False, False)):
+            with open(cfg, "w") as f:
+                json.dump({"hold_all": val}, f)
+            assert L._load_hold_all() is want
+        # 无 hold_all 键 → 回退默认 HOLD_ALL(False)
+        with open(cfg, "w") as f:
+            json.dump({}, f)
+        assert L._load_hold_all() is False
+    finally:
+        if existed:
+            open(cfg, "w").write(saved)
+        elif os.path.exists(cfg):
+            os.remove(cfg)
+
+
 def test_build_orders_rounding():
     """D5: 整手四舍五入（12.5 lot → 1300，非向下 1200）。"""
     recent = {"510300": [4.0] * 10}
@@ -76,6 +98,47 @@ def test_limit_pct():
     assert mc._limit("159941") == 0.10   # 159 段跨境纳指（防前缀误判为 20%）
     assert mc._limit("518880") == 0.10   # 商品黄金
     assert mc._limit("511010") == 0.10   # 国债
+
+
+def test_hold_all_equal_weight():
+    """J2: hold_all=True → 等权持有全部有历史的候选(不选 top_n、不切防守)；
+    False → 仅 top_n。关闭风控叠加(vol_target/trend)以纯测选股 vs 全池的权重结构。
+    合成 7 只单调上涨、斜率递增的收盘 → 动量全正、排序确定。"""
+    n = 200
+    # 斜率随 enumerate 递增：动量全为正、且后入池的标的动量更高（top_n 选股可确定性判定）
+    base = {c: np.linspace(1.0, 1.0 + i * 0.3, n).tolist() for i, c in enumerate(mc.POOL)}
+    # hold_all：全部 7 只、等权、无防守资产
+    t_hold, _ = mc.decide_targets(base, vol_target=None, hold_all=True)
+    assert set(t_hold) == set(mc.POOL)                  # 全池，未切防守(511010)
+    ws = list(t_hold.values())
+    assert max(ws) - min(ws) < 1e-9                     # 等权
+    assert abs(sum(ws) - mc.CASH_BUFFER) < 1e-9
+    # 选股：动量全正 → 仅持 top_n、无防守，且是动量最高的那 top_n 只
+    t_sel, p_sel = mc.decide_targets(base, vol_target=None, hold_all=False)
+    top = set(sorted(mc.POOL, key=lambda c: base[c][-1] / base[c][0], reverse=True)[:mc.TOP_N])
+    assert set(t_sel) == top
+    assert len(p_sel) == mc.TOP_N
+
+
+def test_crossmarket_globals_swap():
+    """J1: _us_globals 临时换美股池跑通回测,退出后恢复 A 股池。合成价格验证整条跨市场链路。
+    关键回归:trend_code 必须显式传(默认在 def 时绑定沪深300,改全局无效);退出后池子须原样还原。"""
+    import crossmarket as cm
+    rng = np.random.default_rng(11)
+    cols = list(cm.POOL_US) + [cm.DEFENSE_US[0]]
+    idx = pd.date_range("2010-01-01", periods=1500, freq="B")
+    # 各标的随机游走 + 不同漂移,给动量排序提供信号;波动 0.011 保夏普有限
+    px = pd.DataFrame(
+        {c: 100 * np.cumprod(1 + rng.normal(0.0004 + i * 0.0001, 0.011, len(idx)))
+         for i, c in enumerate(cols)}, index=idx)
+    before = dict(mc.POOL)
+    with cm._us_globals():
+        assert set(mc.POOL) == set(cm.POOL_US)                  # 进入→美股池
+        nav, ret, _, _ = e.backtest(px, hold_all=False, trend_ma=200, trend_code=cm.BENCH_US)
+        assert len(nav) > 1000
+        assert np.isfinite(e.perf(nav, ret)["夏普"])
+    assert mc.POOL == before                                     # 退出→A 股池原样还原
+    cm.run_crossmarket(px)                                       # 整条链路(含 bootstrap)不报错
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

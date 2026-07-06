@@ -48,6 +48,15 @@ LOOKBACK_WEIGHTS = None
 MAX_LOOKBACK = max(LOOKBACKS)          # 需要的最少历史长度（注意：跳过期 skip 会额外吃历史，见 blended_momentum）
 TOP_N = 3                              # 持有动量最高的前 N 只（等权）
 CASH_BUFFER = 0.99                     # 目标仓位上限（留 1% 现金，吸收手续费/滑点）
+
+# ---- 部署模式:动量选股 vs 等权全池(J1/J2 结论落地)----
+# False(默认)= 动量轮动:按混合动量选 top_n + 绝对动量切防守(向后兼容)。
+# True = 等权全池+风控:跳过选股与绝对动量,等权持有全部有足够历史的候选标的,风控
+#       (vol_target/趋势/崩溃/回撤)原样运行。J1(美股 23 年)+ J2(A 股)两市一致结论:
+#       动量选股无可靠 alpha(bootstrap P=0.148 / 0.560)、选股还略抬高回撤;等权全池版
+#       夏普≈选股版、回撤更浅、少一层过拟合风险。重稳健可切 True。实盘由 etf_momentum_live
+#       读 live_config.json 的 "hold_all" 覆盖此默认(见 _load_hold_all)。
+HOLD_ALL = False
 VOL_TARGET = 0.15                      # 年化目标波动；组合近期波动超此值就降风险仓（None=关闭）
 VOL_WINDOW = 20                        # 估计近期波动的回看交易日
 COMMISSION = 0.00025                   # 单边手续费
@@ -232,7 +241,8 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
                    crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
                    drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
-                   dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None, max_weight=None):
+                   dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None, max_weight=None,
+                   hold_all=False):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。
@@ -245,11 +255,14 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
       skip_recent:   算动量时跳过最近 N 个交易日（21≈跳过1个月，避开短期反转），透传给 blended_momentum。
       risk_adj:      是否用风险调整动量（动量÷波动），透传给 blended_momentum。
       mom_weights:   混合动量各窗口加权（None=等权，默认）；序列则与 lookbacks 对齐、长窗口可更高权（A2），透传给 blended_momentum。
+      hold_all:      J2 诊断对照——True 时跳过动量选股(top_n 排序)与绝对动量(≤0 切防守)，
+                     改为等权持有"全部有足够历史的候选标的"(候选集与部署策略同时点一致，
+                     只差"选不选")，风控叠加(vol/trend/crash/drawdown)原样运行。默认 False(部署行为)。
     输出:
       target: {code: 目标权重}，键可能含防守资产 DEFENSE[0]，权重和 ≈ cash_buffer。
       picks:  [中文名, ...]  本次实际持有的标的（用于日志）。
     规则: 按混合动量排序取前 top_n；某只动量>0→持有它，≤0→该仓位切防守资产；
-          最后按波动率目标对股票仓位整体缩放。
+          最后按波动率目标对股票仓位整体缩放。(hold_all=True 时改为等权全池不选股,J2 对照)
     """
     # === 第一步：算每只候选标的的混合动量分 ===
     moms = []
@@ -264,44 +277,56 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
     if len(moms) < top_n:
         return {}, []          # 可选标的不足（如回测初期），空仓/保持现状
 
-    # === 第二步：按动量从高到低取前 top_n，分配权重（等权 / 反向波动） ===
-    moms.sort(key=lambda x: x[0], reverse=True)
-    picks_raw = moms[:top_n]
-
+    # === 第二步：构造目标权重（hold_all 走对照分支，否则动量选股） ===
     target, picks = {}, []
     dcode = DEFENSE[0]
     dcode_cash = defense_cash or dcode   # B2 分档:动量≤0 / vol_target 挪货基(defense_cash),无则=国债
-    # 入选标的的目标权重 weights[code]：
-    #   equal  : 每只 cash_buffer/top_n（原行为，向后兼容）
-    #   inv_vol: 权重 ∝ 1/σ_i 后归一化到 cash_buffer（改进项 C1）。任一只波动数据不足
-    #            → 用 1 顶替（与其它同尺度归一化，退化为等权，不报错）。
-    if weighting == "inv_vol":
-        raw = {}
-        for _m, code in picks_raw:
-            arr = recent_closes.get(code)
-            end = len(arr) - 1 if arr else -1
-            v = _asset_daily_vol(arr, end, inv_vol_window) if end >= 0 else None
-            raw[code] = (1.0 / v) if (v and v > 0) else 1.0      # 无波动数据 → 等权兜底
-        s = sum(raw.values())
-        weights = {c: cash_buffer * raw[c] / s for c in raw} if s > 0 else {}
-    else:                                                        # equal
-        weights = {c: cash_buffer / top_n for _m, c in picks_raw}
-    for mom, code in picks_raw:
-        w = weights.get(code, cash_buffer / top_n)              # 兜底等权
-        if mom > 0:                                             # 绝对动量为正 → 真持有该 ETF
-            target[code] = target.get(code, 0.0) + w
-            picks.append(POOL[code])
-        else:                                                   # 动量≤0 → 这一份切防守资产（国债）
-            target[dcode_cash] = target.get(dcode_cash, 0.0) + w
-            picks.append(DEFENSE[1])
 
-    # C3 单标的集中度上限(默认 None 关):个股权重超 max_weight 的部分挪防守资产。
-    #   等权 top_n=3 下单只≈33%、默认不触发;启用 inv_vol(C1)或集中 top_n 时可设(如 0.40)。
-    if max_weight:
-        for c in [c for c in target if c != dcode and target[c] > max_weight]:
-            excess = target[c] - max_weight
-            target[c] = max_weight
-            target[dcode_cash] = target.get(dcode_cash, 0.0) + excess
+    if hold_all:
+        # J2 对照（诊断用，非部署）：跳过动量选股（top_n 排序）与绝对动量（≤0 切防守），
+        # 改为等权持有"全部有足够历史的候选标的"——候选集沿用上面 blended_momentum 的 None
+        # 判定，保证与部署策略同一时点的候选池完全一致（只差"选不选"），后续风控叠加
+        # （vol/trend/crash/drawdown）原样运行。用于回答"动量选股相对等权全池有无边际"。
+        n_hold = len(moms)
+        w_each = cash_buffer / n_hold
+        for _m, code in moms:
+            target[code] = target.get(code, 0.0) + w_each
+            picks.append(POOL[code])
+    else:
+        # 按动量从高到低取前 top_n，分配权重（等权 / 反向波动）
+        moms.sort(key=lambda x: x[0], reverse=True)
+        picks_raw = moms[:top_n]
+        # 入选标的的目标权重 weights[code]：
+        #   equal  : 每只 cash_buffer/top_n（原行为，向后兼容）
+        #   inv_vol: 权重 ∝ 1/σ_i 后归一化到 cash_buffer（改进项 C1）。任一只波动数据不足
+        #            → 用 1 顶替（与其它同尺度归一化，退化为等权，不报错）。
+        if weighting == "inv_vol":
+            raw = {}
+            for _m, code in picks_raw:
+                arr = recent_closes.get(code)
+                end = len(arr) - 1 if arr else -1
+                v = _asset_daily_vol(arr, end, inv_vol_window) if end >= 0 else None
+                raw[code] = (1.0 / v) if (v and v > 0) else 1.0      # 无波动数据 → 等权兜底
+            s = sum(raw.values())
+            weights = {c: cash_buffer * raw[c] / s for c in raw} if s > 0 else {}
+        else:                                                        # equal
+            weights = {c: cash_buffer / top_n for _m, c in picks_raw}
+        for mom, code in picks_raw:
+            w = weights.get(code, cash_buffer / top_n)              # 兜底等权
+            if mom > 0:                                             # 绝对动量为正 → 真持有该 ETF
+                target[code] = target.get(code, 0.0) + w
+                picks.append(POOL[code])
+            else:                                                   # 动量≤0 → 这一份切防守资产（国债）
+                target[dcode_cash] = target.get(dcode_cash, 0.0) + w
+                picks.append(DEFENSE[1])
+
+        # C3 单标的集中度上限(默认 None 关):个股权重超 max_weight 的部分挪防守资产。
+        #   等权 top_n=3 下单只≈33%、默认不触发;启用 inv_vol(C1)或集中 top_n 时可设(如 0.40)。
+        if max_weight:
+            for c in [c for c in target if c != dcode and target[c] > max_weight]:
+                excess = target[c] - max_weight
+                target[c] = max_weight
+                target[dcode_cash] = target.get(dcode_cash, 0.0) + excess
 
     # === 第三步：波动率目标。组合近期波动超标 → 整体缩股票仓，缩出来的挪进防守资产 ===
     eq_codes = [c for c in target if c != dcode]   # 真正持有的股票（不含国债）

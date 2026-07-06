@@ -18,3 +18,7 @@ ETF动量轮动_回测结果.png
 # 实盘凭证（本地持有，不入仓库；etf_momentum_live._load_live_secret 在环境变量缺失时读它）
 # 样例见 live_config.example.json
 live_config.json
+
+# 美股 ETF 日线 CSV（J1 跨市场验证用；用户从外部源导出后放入，不入仓库）
+# crossmarket.load_us_etfs 在 stooq/yfinance 不可用时回退读这里
+usdata/

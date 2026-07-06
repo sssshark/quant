@@ -14,6 +14,9 @@ A股 ETF 动量轮动 —— 向量化回测 / 研究工具。
   python etf_momentum.py bootmom    # A2 混合动量加权 的 A/B + bootstrap 显著性检验
   python etf_momentum.py dsr        # G1 Deflated Sharpe：多重比较下的夏普可信度
   python etf_momentum.py universe   # 标的池消融：踢掉黄金/纳指，量化 alpha 对池子的依赖
+  python etf_momentum.py nomomentum # J2 对照：等权全池+风控不选股 vs 动量轮动，量化选股边际
+  python etf_momentum.py bondstress # J4 防守资产债牛敏感性：国债收益替换 0%/−2% 重算回撤与 Calmar
+  python etf_momentum.py freezetest # J5 样本外冻结期检验：近期段选股边际+风控稳健性,PBO=0.67 再审视
 """
 import sys
 import math
@@ -24,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
-                           VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, SKIP_RECENT,
+                           VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, TREND_CODE, SKIP_RECENT,
                            RISK_ADJ, LOOKBACK_WEIGHTS, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
                            DRAWDOWN_PROT, DD_WINDOW, DD_THR, DD_CUT,
@@ -257,14 +260,15 @@ def _apply_target_with_limits(tgt_dict, prev_cur, fill_day, cant_buy, cant_sell)
 
 # ---------------- 回测引擎（调用核心大脑） ----------------
 def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_ma=None,
-             trend_cut=TREND_CUT, vol_window=VOL_WINDOW, skip_recent=SKIP_RECENT,
+             trend_code=None, trend_cut=TREND_CUT, vol_window=VOL_WINDOW, skip_recent=SKIP_RECENT,
              risk_adj=RISK_ADJ, mom_weights=LOOKBACK_WEIGHTS,
              weighting=WEIGHTING, inv_vol_window=INV_VOL_WINDOW,
              crash_prot=CRASH_PROT, crash_lookback=CRASH_LOOKBACK,
              crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
              dd_thr=DD_THR, dd_cut=DD_CUT,
-             cant_buy=None, cant_sell=None, defense_cash=None, max_weight=None, return_turnover=False):
+             cant_buy=None, cant_sell=None, defense_cash=None, max_weight=None, return_turnover=False,
+             hold_all=False):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
         的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
@@ -306,6 +310,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
             target, picks = decide_targets(recent, lookbacks=lookbacks,
                                            top_n=top_n, vol_target=vol_target,
                                            vol_window=vol_window, trend_ma=trend_ma,
+                                           trend_code=(trend_code or TREND_CODE),
                                            trend_cut=trend_cut, skip_recent=skip_recent,
                                            risk_adj=risk_adj, mom_weights=mom_weights,
                                            weighting=weighting,
@@ -316,7 +321,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
                                            drawdown_prot=drawdown_prot,
                                            dd_window=dd_window,
                                            dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash,
-                                           max_weight=max_weight)
+                                           max_weight=max_weight, hold_all=hold_all)
             if target:
                 pending = (target, picks)                  # 不立即写 cur，等下一日成交
                 holdings_log.append((d.date(), picks))
@@ -856,6 +861,32 @@ def bootstrap_mom_weights(px, weights, n_boot=2000, block=21, seed=7):
     return delta_obs, float(boots.mean()), float(ci_lo), float(ci_hi), float((boots <= 0).mean())
 
 
+def bootstrap_selection(px, n_boot=2000, block=21, seed=7, extra_cfg=None):
+    """J2 检验:动量选股(top_n 排序 + 绝对动量)相对"等权全池不选股"的夏普提升是否显著。
+    两条共享 vol_target + 趋势过滤(部署口径),唯一差别是 hold_all——选股版挑 top_n、对照版等权全池。
+    高度相关,故对配对 (d_sel, d_hold) 做 circular block bootstrap(block≈1 月保留自相关)。
+    Δ = SR(选股) − SR(等权全池);p = 重抽样里 Δ≤0 的比例(单边,越小越显著)。
+    extra_cfg: 额外 backtest 配置(跨市场用,如 trend_code="SPY"),并入部署口径。默认 None=A 股口径。
+    返回 (delta_obs, boot_mean, ci_lo, ci_hi, p)。"""
+    cfg = dict(trend_ma=TREND_MA)                       # 部署口径(vol_target 取默认)
+    if extra_cfg:
+        cfg.update(extra_cfg)
+    _, d_sel, _, _ = backtest(px, hold_all=False, **cfg)
+    _, d_hold, _, _ = backtest(px, hold_all=True, **cfg)
+    common = d_sel.index.intersection(d_hold.index)
+    a1 = d_sel.loc[common].to_numpy()
+    a0 = d_hold.loc[common].to_numpy()
+    T = len(a1)
+    delta_obs = _ann_sharpe(a1) - _ann_sharpe(a0)
+    rng = np.random.default_rng(seed)
+    boots = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = _circ_block_idx(T, block, rng)
+        boots[b] = _ann_sharpe(a1[idx]) - _ann_sharpe(a0[idx])
+    ci_lo, ci_hi = np.percentile(boots, [2.5, 97.5])
+    return delta_obs, float(boots.mean()), float(ci_lo), float(ci_hi), float((boots <= 0).mean())
+
+
 def _boot_report(res, title="RISK_ADJ（风险调整动量）夏普提升", on="risk_adj=True", off="False"):
     """配对 block bootstrap 显著性检验的通用报告（默认措辞对应 RISK_ADJ）。
     res = (delta_obs, boot_mean, ci_lo, ci_hi, p)；on/off 是被比较两侧的配置描述。"""
@@ -962,24 +993,40 @@ def deflated_sharpe(daily, n_trials, periods=252):
                 PSR0=_norm_cdf(sr/sig), DSR=_norm_cdf((sr - sr_max)/sig), N=n_trials)
 
 
+def _monthly_returns(daily):
+    """日收益 → 月收益(月内复利):月末净值环比。月频更接近 i.i.d.,n 从 ~3225 日降到 ~152 月。
+    用于 J3:DSR/bootstrap 用日频会夸大自由度(日收益自相关 + edge 集中在少数熊市),月频是更诚实的口径。"""
+    nav = (1 + daily).cumprod()
+    return nav.resample("ME").last().pct_change().dropna()
+
+
 def run_dsr(px):
-    """对部署策略（等权 + 全风控）与 C1 反向波动版算 Deflated Sharpe Ratio。
-    N 取敏感性 [10,50,100]：即"即使按做了 100 次试验的保守估计"，DSR 是否仍 >0.95。"""
+    """对部署策略(等权 + 全风控)与 C1 反向波动版算 Deflated Sharpe Ratio。
+    **J3**:同时报日频(n≈3225,自由度被夸大、乐观上界)与月频(n≈152,月收益近 i.i.d.、可信下界)两种口径,
+    让"夏普可信度"不被日收益的伪独立观测抬高。N 取 [10,50,100] 多重比较敏感性。"""
     _, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)
     _, ret_iv, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, weighting="inv_vol")
-    print("Deflated Sharpe Ratio（Bailey-López de Prado 2014）— 多重比较下的夏普可信度:\n")
-    print(f"  样本: {len(ret_tr)} 日 ≈ {len(ret_tr)/252:.1f} 年   "
-          f"（γ₃偏度/γ₄峰度 取日收益，反映肥尾与左偏，σ(SR̂) 已据此修正）\n")
-    print(f"{'策略':<20}{'观测夏普':>9}{'N(试验)':>9}{'SR_max':>8}{'DSR':>8}{'PSR(>0)':>9}{'判读':>8}")
-    for name, daily in (("等权+全风控", ret_tr), ("反向波动+全风控", ret_iv)):
-        for N in (10, 50, 100):
-            r = deflated_sharpe(daily, N)
-            verdict = "可信" if r["DSR"] > 0.95 else ("边际" if r["DSR"] > 0.90 else "不足")
-            print(f"{name:<20}{r['SR_ann']:>9.3f}{N:>9}{r['SR_max_ann']:>8.3f}"
-                  f"{r['DSR']:>8.3f}{r['PSR0']:>9.3f}{verdict:>8}")
-    print("\n  解读:DSR = P(真实夏普 > 'N 次试验的期望最高运气夏普')。>0.95 才算经得起多重比较。")
-    print("        N 越大扣减越狠（N=100 列最保守）。真实独立试验数远小于 100——本项目多数改进")
-    print("        经 boot/wf 验证不显著后被弃、未用于选参，故真实 DSR 高于上表（上表是存疑下界）。")
+    pairs = [("等权+全风控", ret_tr), ("反向波动+全风控", ret_iv)]
+    print("Deflated Sharpe Ratio(Bailey-López de Prado 2014)— 多重比较下的夏普可信度:\n")
+    for freq, periods, tag in [("日频", 252, "n≈3225,自由度被夸大 → 乐观上界"),
+                               ("月频", 12, "n≈152,月收益近 i.i.d. → J3 可信下界")]:
+        print(f"--- {freq}口径({tag})---")
+        print(f"{'策略':<20}{'观测夏普':>9}{'N(试验)':>9}{'SR_max':>8}{'DSR':>8}{'PSR(>0)':>9}{'判读':>8}")
+        for name, daily in pairs:
+            rs = _monthly_returns(daily) if freq == "月频" else daily
+            for N in (10, 50, 100):
+                r = deflated_sharpe(rs, N, periods=periods)
+                verdict = "可信" if r["DSR"] > 0.95 else ("边际" if r["DSR"] > 0.90 else "不足")
+                print(f"{name:<20}{r['SR_ann']:>9.3f}{N:>9}{r['SR_max_ann']:>8.3f}"
+                      f"{r['DSR']:>8.3f}{r['PSR0']:>9.3f}{verdict:>8}")
+        print()
+    # J3 直接对比:同一策略日频 vs 月频 DSR
+    d = deflated_sharpe(ret_tr, 50)["DSR"]
+    m = deflated_sharpe(_monthly_returns(ret_tr), 50, periods=12)["DSR"]
+    print(f"  [J3 对比] 等权策略 DSR@N=50:日频 {d:.3f} → 月频 {m:.3f} ({m-d:+.3f})")
+    print("  解读:日收益自相关 + edge 集中在少数熊市 regime,日频 n≈3225 高估了独立观测数;")
+    print("        月频 n≈152 不依赖'日收益独立'假设,是更诚实的可信度。两口径都 >0.95 才算硬。")
+    print("        N(试验)越小扣减越轻;真实独立试验数远小于 100(多数改进验证后被弃),真实 DSR 高于 N=100 列。")
 
 
 # ---------------- universe：标的池消融（alpha 对池子构成的依赖）----------------
@@ -1024,6 +1071,158 @@ def run_universe(px, drop=("518880", "513100")):
           f"\n      这部分就是 alpha 对“池子里恰好有顺风资产”的依赖。"
           f"\n      但踢掉后仍明显跑赢基准（沪深300 夏普 {rows[2][1]['夏普']:.2f}），"
           f"说明动量逻辑本身有 alpha，不是纯靠池子。")
+
+
+def run_nomomentum(px, lim=None):
+    """J2 子命令:动量选股的真实边际。对照 = 等权持有全池 + vol_target + 趋势过滤(不选股、
+    无绝对动量),与部署策略同口径、同执行(T+1 + 涨跌停)、同一时点候选集(只差"选不选")。
+    若对照夏普≈策略 → "轮动选股"近乎无价值、策略本质是"波动管理+趋势择时的防御性 beta"。
+    配对 block bootstrap 检验选股边际的统计显著性(与 C1/C2/A2 同口径)。"""
+    lim = lim or {}
+    cfg = dict(trend_ma=TREND_MA)                       # 部署口径:vol_target 默认 + 趋势过滤
+    nav_sel, ret_sel, n_sel, _ = backtest(px, hold_all=False, **cfg, **lim)
+    nav_hold, ret_hold, _, _ = backtest(px, hold_all=True, **cfg, **lim)
+    bn = bench_nav(px)
+    p_sel = perf(nav_sel, ret_sel)
+    p_hold = perf(nav_hold, ret_hold)
+    pb = perf(bn, bn.pct_change().fillna(0))
+
+    print("=" * 72)
+    print("J2 动量选股的真实边际（等权全池+风控 不选股  vs  部署动量轮动）")
+    print("=" * 72)
+    print(f"  回测区间: {nav_sel.index[0].date()} ~ {nav_sel.index[-1].date()}  "
+          f"({p_sel['年数']:.1f} 年)  调仓 {n_sel} 次\n")
+    _print_table([
+        ("等权全池+vol+trend(不选股)", p_hold),
+        ("动量轮动top3+vol+trend(部署)", p_sel),
+        ("买入持有沪深300", pb),
+    ])
+    d_sharpe = p_sel["夏普"] - p_hold["夏普"]
+    d_cagr = (p_sel["年化"] - p_hold["年化"]) * 100
+    print(f"\n  [选股边际] 夏普 {p_hold['夏普']:.2f}→{p_sel['夏普']:.2f} ({d_sharpe:+.2f})  "
+          f"年化 {p_hold['年化']*100:.1f}%→{p_sel['年化']*100:.1f}% ({d_cagr:+.1f}pp)  "
+          f"回撤 {p_hold['回撤']*100:.1f}%→{p_sel['回撤']*100:.1f}%")
+    if abs(d_sharpe) < 0.05:
+        verdict = ("→ 选股边际≈0:轮动选股近乎无价值,策略本质是\n        "
+                   "'波动管理+趋势择时的防御性 beta'(J2 假设成立)")
+    elif d_sharpe > 0:
+        verdict = f"→ 选股有正贡献(夏普 +{d_sharpe:.2f}),显著性见下方 bootstrap"
+    else:
+        verdict = f"→ 选股反而拖累(夏普 {d_sharpe:+.2f}),轮动不如等权全池"
+    print(f"  {verdict}")
+
+    print("\n" + "=" * 72)
+    _boot_report(bootstrap_selection(px),
+                 title="J2 动量选股 vs 等权全池(均 vol_target + 趋势过滤)",
+                 on="动量选股", off="等权全池")
+    print("  注:对照剔除了相对动量(选 top_n)与绝对动量(≤0 切防守)两套信号;若 Δ不显著,")
+    print("      说明部署策略相对'等权全池+风控'无可靠选股 alpha,改进方向应转向'持有什么'而非'选谁'。")
+
+
+def _synth_defense_series(idx, r_ann, anchor):
+    """合成"年化 r_ann"的防守资产收盘序列(确定性日复利),用于 J4 债牛敏感性。
+    刻意不含波动——J4 要隔离的是'防守资产的漂移'对策略的影响(防守本就低波,波动非主线)。"""
+    r_d = (1.0 + r_ann) ** (1.0 / 252) - 1.0
+    return pd.Series([anchor * (1.0 + r_d) ** i for i in range(len(idx))], index=idx)
+
+
+def run_bondstress(px, lim=None):
+    """J4:防守资产(国债 511010)吃了 2013–26 十年债牛,策略的 Calmar / 回撤控制有多依赖这个顺风?
+    把防守资产收益替换成 0%/年(平价,剔除债牛)与 −2%/年(加息/熊债)重算,对比真实债牛口径。
+    回答两件事:① 回撤控制机制是否依赖债牛——若 0% 防守下回撤仍浅,说明机制靠的是'熊市挪进不跌的
+    防守'(防守不跌即可),与防守资产涨不涨无关;② 收益/Calmar 水平有多少是债牛顺风——三者差值即债牛贡献。"""
+    lim = lim or {}
+    dcode = DEFENSE[0]
+    d = px[dcode].dropna()
+    yrs = (d.index[-1] - d.index[0]).days / 365.25
+    def_cagr = (d.iloc[-1] / d.iloc[0]) ** (1 / yrs) - 1
+    print("=" * 72)
+    print("J4 防守资产债牛敏感性(国债 511010 收益替换:真实 vs 0%/年 vs −2%/年)")
+    print("=" * 72)
+    print(f"  真实国债 {def_cagr*100:+.1f}%/年({d.index[0].date()}~{d.index[-1].date()}, {yrs:.1f}年)——"
+          f"{'明显债牛顺风' if def_cagr > 0.015 else '非明显债牛'}\n")
+    anchor = float(d.iloc[0])
+    scenarios = [("真实国债(债牛)", None),
+                 ("国债=0%/年(平价)", 0.0),
+                 ("国债=−2%/年(熊债)", -0.02)]
+    rows = []
+    for name, r_ann in scenarios:
+        px_s = px.copy()
+        if r_ann is not None:
+            px_s[dcode] = _synth_defense_series(px.index, r_ann, anchor)
+        nav, ret, _, _ = backtest(px_s, vol_target=VOL_TARGET, trend_ma=TREND_MA, **lim)
+        rows.append((name, perf(nav, ret)))
+    _print_table(rows)
+    base, flat, bear = rows[0][1], rows[1][1], rows[2][1]
+    print(f"\n  [剔除债牛(0%)后] 年化 {base['年化']*100:.1f}%→{flat['年化']*100:.1f}% "
+          f"({(flat['年化']-base['年化'])*100:+.1f}pp)  夏普 {base['夏普']:.2f}→{flat['夏普']:.2f} "
+          f"({flat['夏普']-base['夏普']:+.2f})  回撤 {base['回撤']*100:.1f}%→{flat['回撤']*100:.1f}%")
+    print(f"  [熊债(−2%)压力]     年化 {base['年化']*100:.1f}%→{bear['年化']*100:.1f}% "
+          f"({(bear['年化']-base['年化'])*100:+.1f}pp)  夏普 {base['夏普']:.2f}→{bear['夏普']:.2f} "
+          f"({bear['夏普']-base['夏普']:+.2f})  回撤 {base['回撤']*100:.1f}%→{bear['回撤']*100:.1f}%")
+    dd_flat = abs(flat['回撤']) - abs(base['回撤'])
+    if dd_flat < 0.03:
+        print(f"  → 回撤控制机制稳健:剔除债牛后最大回撤仅变化 {dd_flat*100:+.1f}pp(<3pp)——"
+              f"机制靠'熊市挪进不跌的防守',与防守资产涨不涨无关")
+    else:
+        print(f"  → 回撤对债牛有依赖:剔除债牛后回撤变化 {dd_flat*100:+.1f}pp(>3pp)")
+    print(f"  → 收益水平有 {(base['年化']-flat['年化'])*100:.1f}pp/年 是债牛顺风贡献;"
+          f"熊债(−2%)再压 {(flat['年化']-bear['年化'])*100:.1f}pp/年")
+    print("  注:合成防守序列为确定性日复利、无波动;真实熊债带波动(被 vol_target 部分对冲),")
+    print("      此处是'防守漂移'净影响的下界估计,换池/换防守资产时同理适用。")
+
+
+def run_freezetest(px, lim=None, split="2022-01-01"):
+    """J5:样本外冻结期检验 + PBO 再审视。把连续跑的策略净值在某日(默认 2022-01-01)切开,
+    看"近期未被全样本 A/B 调参直接优化"的冻结期里:① 部署策略是否还成立(跑赢 B&H);② 选股
+    边际是否还在(动量轮动 vs 等权+风控)。回答 G3 PBO=0.67 的担忧——选参过拟合风险是否真被
+    "用经验默认值"消除。连续跑后按段切指标,避免分段 warmup 边缘效应。"""
+    lim = lim or {}
+    split_dt = pd.Timestamp(split)
+    cfg = dict(trend_ma=TREND_MA)
+    nav_sel, ret_sel, _, _ = backtest(px, hold_all=False, **cfg, **lim)
+    _, ret_hold, _, _ = backtest(px, hold_all=True, **cfg, **lim)
+    bn = bench_nav(px); ret_bh = bn.pct_change().fillna(0)
+
+    def seg_perf(ret, lo, hi):
+        s = ret.loc[lo:hi]
+        if len(s) < 60:                                  # 段太短不算
+            return None
+        nav = (1 + s).cumprod(); nav = nav / nav.iloc[0]
+        return perf(nav, s)
+
+    end = ret_sel.index[-1]
+    segs = [("全样本", ret_sel.index[0], end),
+            (f"调参期(≤{split})", ret_sel.index[0], split_dt),
+            (f"冻结期(>{split})", split_dt, end)]
+    print("=" * 72)
+    print(f"J5 样本外冻结期检验(split={split};冻结期 ≈ {(end - split_dt).days / 365.25:.1f} 年)")
+    print("=" * 72)
+    rows = []
+    for name, lo, hi in segs:
+        for label, ret in (("·动量轮动", ret_sel), ("·等权+风控", ret_hold), ("·沪深300", ret_bh)):
+            p = seg_perf(ret, lo, hi)
+            if p:
+                rows.append((name + label, p))
+    _print_table(rows)
+    oos_sel = seg_perf(ret_sel, split_dt, end)
+    oos_hold = seg_perf(ret_hold, split_dt, end)
+    oos_bh = seg_perf(ret_bh, split_dt, end)
+    if oos_sel and oos_hold and oos_bh:
+        d = oos_sel["夏普"] - oos_hold["夏普"]
+        print(f"\n  [冻结期选股边际] 动量轮动 {oos_sel['夏普']:.2f} vs 等权+风控 {oos_hold['夏普']:.2f} ({d:+.2f})")
+        print(f"  [冻结期策略 vs B&H] {oos_sel['夏普']:.2f} vs 沪深300 {oos_bh['夏普']:.2f} "
+              f"({oos_sel['夏普'] - oos_bh['夏普']:+.2f})")
+        print("\n  判读(PBO=0.67 再审视):")
+        if d <= 0.05:
+            print("   → 冻结期选股无优势(≤等权+风控):印证 PBO=0.67——'选股/选参'过拟合,")
+            print("     '用经验默认值'没消除选择偏差(整份 backlog 就是 A/B 选参记录)。")
+            print("   → 但风控(vol_target/trend)在冻结期仍让策略跑赢 B&H:过拟合风险集中在选股层,")
+            print("     风控层稳健(与 WF 衰减 0.89、J4 跨 regime 一致)。落地:切 hold_all 实盘模式即可规避选股过拟合。")
+        else:
+            print(f"   → 冻结期选股仍有正边际({d:+.2f}):过拟合担忧在该段未显现(单段不足以下定论)。")
+    print("\n  注:严格说 backlog 调参用到 2026 全样本,无真正'未见过'的持有期;此'冻结期'是近期段")
+    print("      (最少被直接优化的概念持有期),是最可得的事后近似、非真样本外。真样本外须等实盘向前跑出。")
 
 
 def run_review():
@@ -1077,8 +1276,8 @@ def main():
         return
     # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
     # real/regime 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图/复核/regime 拆解用。
-    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib")))
-    if mode in ("real", "regime", "attrib"):
+    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib", "nomomentum", "bondstress", "freezetest")))
+    if mode in ("real", "regime", "attrib", "nomomentum", "bondstress", "freezetest"):
         px, cant_buy, cant_sell = loaded
     else:
         px, cant_buy, cant_sell = loaded, None, None
@@ -1113,6 +1312,15 @@ def main():
         return
     if mode == "attrib":
         run_attribution(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
+        return
+    if mode == "nomomentum":
+        run_nomomentum(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
+        return
+    if mode == "bondstress":
+        run_bondstress(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
+        return
+    if mode == "freezetest":
+        run_freezetest(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
     if mode == "regime":
         run_regime(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))

@@ -25,7 +25,7 @@ import json
 import datetime as dt
 
 from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
-                           TREND_MA, _limit, decide_targets)
+                           TREND_MA, HOLD_ALL, _limit, decide_targets)
 
 # 取数长度要同时够"动量回看"和"大盘趋势均线"两者，取较大值（趋势用 200 日均线 > 126）
 HISTORY_BARS = max(MAX_LOOKBACK, TREND_MA)
@@ -72,6 +72,22 @@ QMT_PATH = _load_live_secret("qmt_path", "QMT_PATH", _QMT_PATH_DEFAULT)
 ACCOUNT_ID = _load_live_secret("account_id", "QMT_ACCOUNT_ID", _ACCOUNT_ID_DEFAULT)
 SESSION_ID = int(dt.datetime.now().timestamp())  # 任意整数，连接会话号
 DEMO_TOTAL = 100_000.0                            # 兜底：完全连不上时的假定总资产
+
+
+def _load_hold_all():
+    """读部署模式 hold_all:live_config.json 的 "hold_all" 键 > momentum_core.HOLD_ALL 默认。
+    True = 等权全池+风控(J1/J2 证的稳健版:两市均显示动量选股无可靠 alpha,选股还略抬高回撤);
+    False = 动量轮动(默认)。非敏感的策略开关,故只读本地配置文件(不走环境变量)。"""
+    cfg = os.path.join(os.path.dirname(__file__), "live_config.json")
+    if os.path.exists(cfg):
+        try:
+            with open(cfg, "r", encoding="utf-8") as f:
+                v = json.load(f).get("hold_all")
+                if v is not None:
+                    return bool(v)
+        except Exception as e:
+            print(f"[warn] 读 live_config.json 的 hold_all 失败（{e}），用默认 {HOLD_ALL}。")
+    return HOLD_ALL
 
 
 # ---------------- 1) 行情：最近 N 日收盘 ----------------
@@ -306,7 +322,10 @@ def main():
     recent = get_recent_closes(codes, HISTORY_BARS)   # 取够 200 根，趋势过滤才不会静默失效
     price = {c: arr[-1] for c, arr in recent.items()}
 
-    target, names = decide_targets(recent, trend_ma=TREND_MA)
+    hold_all = _load_hold_all()
+    mode_name = "等权全池+风控(不选股,J1/J2 稳健版)" if hold_all else "动量轮动(top3+绝对动量)"
+    print(f"[模式] {mode_name}")
+    target, names = decide_targets(recent, trend_ma=TREND_MA, hold_all=hold_all)
     print(f"[{BROKER}] 调仓日:", dt.date.today(), " 目标持有:", names or "（可选标的不足，空仓）")
     if not target:
         return
