@@ -412,6 +412,74 @@ def factor_attribution(daily, bench_daily):
                 策略年化=_ann(p), 基准年化=_ann(b), 超额年化=_ann(p) - _ann(b))
 
 
+# F8 多因子归因的因子定义（全部从已加载的 px 面板构造，无需外部因子数据）。
+# tushare 的 _SOURCE_SHIFT 是死代码（pre_close 法已恢复 512100/513100/518880 早期历史），6 因子全可用。
+# 单代码 = 该资产日收益；(c1, c2) = 零投资 spread = r(c1) − r(c2)。
+_MFACTORS = [
+    ("MKT",  BENCH),                  # 沪深300 市场（CAPM 已有的市场因子）
+    ("SMB",  ("512100", BENCH)),      # 中证1000 − 沪深300（规模：小盘 − 大盘）
+    ("VMG",  ("510880", BENCH)),      # 红利 − 市场（价值/红利倾斜）
+    ("BND",  DEFENSE[0]),             # 国债（水平）★核心：剥离策略大量持有的债券暴露
+    ("GLD",  "518880"),               # 黄金（水平）★核心：剥离黄金暴露
+    ("NSDQ", ("513100", BENCH)),      # 纳指 − 市场（国际成长 QDII）
+]
+
+
+def _factor_returns(px, spec):
+    """从价格面板 px 构造因子日收益 DataFrame。spec: [(名字, 单代码 或 (长, 短)), ...]。
+    单代码 → pct_change；(c1, c2) → r(c1) − r(c2)。全 fillna(0)（停牌/早期未上市段→0 收益）。"""
+    rs = px.pct_change().fillna(0.0)
+    out = {}
+    for name, d in spec:
+        if isinstance(d, str):
+            out[name] = rs[d] if d in rs else pd.Series(0.0, index=rs.index)
+        else:
+            c1, c2 = d
+            out[name] = (rs[c1] if c1 in rs else 0.0) - (rs[c2] if c2 in rs else 0.0)
+    return pd.DataFrame(out, index=rs.index)
+
+
+def factor_attribution_multi(daily, px, factor_spec=None):
+    """F8 多因子归因：策略日收益对 6 因子（MKT/SMB/VMG/BND/GLD/NSDQ）做 OLS 回归，拆 alpha + 各因子
+    beta/年化贡献/t-stat/R²。回答"扣掉策略实际持有的资产类别暴露后，真 alpha 还剩多少"——
+    F4 的 CAPM 只控制市场因子，会把债券/黄金等非权益收益误判成 alpha（本条核心论点，见 test_mfat_strips_spurious_alpha）。
+    无风险利率按 0（与 F4/perf 一致）。返回 dict（观测数不足返回 None）：
+    alpha_ann(年化)、betas/tstats/contribs(各因子,贡献已年化)、R2/R2_adj、corr(因子相关矩阵)、n_obs、sigma_ann(残差年化波动)。"""
+    spec = factor_spec if factor_spec is not None else _MFACTORS
+    fr = _factor_returns(px, spec)
+    common = daily.index.intersection(fr.index)
+    y = daily.loc[common].to_numpy()
+    Xf = fr.loc[common].to_numpy()
+    n, k = len(y), len(spec)
+    if n < k + 5:                                     # 观测数 ≤ 因子数，OLS 无意义
+        return None
+    X = np.column_stack([np.ones(n), Xf])             # 含截距列
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)      # OLS：beta = (X'X)^-1 X'y
+    resid = y - X @ beta
+    ss_res = float(resid @ resid)
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r2_adj = 1.0 - (1.0 - r2) * (n - 1) / (n - k - 1) if (n - k - 1) > 0 else r2
+    sigma2 = ss_res / (n - k - 1)                     # 残差方差（k 个因子 + 1 截距）
+    xtx_inv = np.linalg.pinv(X.T @ X)                 # pinv：近共线性时不崩（beta 用 lstsq 已稳）
+    se = np.sqrt(np.diag(xtx_inv) * sigma2)           # 各系数标准误
+    tstat = beta / np.where(se > 0, se, np.nan)
+    alpha_d = float(beta[0])                          # 截距 = 日 alpha
+    fac_betas = beta[1:]                              # 各因子 beta（不含截距）
+    contribs_d = fac_betas * Xf.mean(axis=0)          # 日贡献 = beta × 因子均值
+    corr = np.corrcoef(Xf, rowvar=False)              # 因子相关矩阵（共线性诊断）
+    names = [s[0] for s in spec]
+    return dict(
+        alpha_ann=alpha_d * 252,                      # 年化 alpha（线性 ×252，与 F4 口径一致）
+        betas={names[i]: float(fac_betas[i]) for i in range(k)},
+        tstats={names[i]: float(tstat[i + 1]) for i in range(k)},
+        contribs={names[i]: float(contribs_d[i] * 252) for i in range(k)},   # 年化贡献
+        R2=float(r2), R2_adj=float(r2_adj),
+        corr={names[i]: {names[j]: float(corr[i, j]) for j in range(k)} for i in range(k)},
+        n_obs=int(n), sigma_ann=float(np.sqrt(sigma2) * np.sqrt(252)),
+    )
+
+
 def run_attribution(px, lim=None, title=""):
     """F4 因子归因子命令：全风控口径（vol+trend）跑一次 backtest，对基准做 CAPM 回归拆 alpha/beta/IR。
     与 run_regime 同源（都用全风控 backtest + 基准对照）。打印归因表，返回 dict。"""
@@ -433,6 +501,42 @@ def run_attribution(px, lim=None, title=""):
     print(f"  → 超额 {a['超额年化']*100:+.1f}% ≈ alpha {a['年化alpha']*100:+.1f}% + beta 拖累 {beta_drag*100:+.1f}%"
           f"（beta={a['beta']:.2f}：低市场暴露，基准上涨时少赚，须靠 alpha 补回）")
     return a
+
+
+def run_mfattribution(px, lim=None, title=""):
+    """F8 多因子归因子命令：全风控口径（vol+trend）跑一次 backtest，对 6 因子做 OLS 拆 alpha/beta/贡献。
+    与 run_attribution（F4 CAPM）同源（同 backtest、同 daily 口径），但补上债券/黄金/小盘/价值/纳指因子——
+    剥离 CAPM 误判为 alpha 的非权益 beta。打印因子表 + CAPM α 对照，返回 dict。"""
+    lim = lim or {}
+    nav, daily, n, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, **lim)
+    bench = px[BENCH].pct_change().fillna(0.0).reindex(daily.index).fillna(0.0)
+    capm = factor_attribution(daily, bench)                    # F4 CAPM α 做对照
+    mf = factor_attribution_multi(daily, px)
+    if mf is None:
+        print("多因子归因失败：观测数不足")
+        return None
+    capm_alpha = capm["年化alpha"] if capm else 0.0
+    capm_r2 = capm["R2"] if capm else 0.0
+    stripped = capm_alpha - mf["alpha_ann"]                    # 被"剥离"的部分
+    print(f"\n=== 多因子归因{'（' + title + '）' if title else ''}"
+          f"（6 因子 MKT/SMB/VMG/BND/GLD/NSDQ，日频 OLS，n={mf['n_obs']}）===")
+    print(f"  CAPM 年化α {capm_alpha*100:+.1f}%  →  多因子年化α {mf['alpha_ann']*100:+.1f}%"
+          f"   被「剥离」{stripped*100:+.1f}%（CAPM 误归为 alpha 的债/金/风格 beta）")
+    print(f"  {'因子':<8}{'beta':>9}{'t-stat':>9}{'年化贡献':>11}")
+    note = {"MKT": " ← 市场暴露", "BND": " ← 债券暴露", "GLD": " ← 黄金暴露"}
+    for name in [s[0] for s in _MFACTORS]:
+        print(f"  {name:<8}{mf['betas'][name]:>9.2f}{mf['tstats'][name]:>9.1f}"
+              f"{mf['contribs'][name]*100:>10.1f}%{note.get(name, '')}")
+    print(f"  R² = {mf['R2']:.2f}（CAPM R²={capm_r2:.2f}）  调整 R² = {mf['R2_adj']:.2f}"
+          f"  残差年化波动 {mf['sigma_ann']*100:.1f}%")
+    names = list(mf["corr"])
+    hi = [(names[i], names[j], mf["corr"][names[i]][names[j]])
+          for i in range(len(names)) for j in range(i + 1, len(names))
+          if abs(mf["corr"][names[i]][names[j]]) > 0.7]
+    if hi:
+        print("  ⚠ 高相关（|corr|>0.7，单 beta 标准误被抬高，alpha 仍无偏）："
+              + "  ".join(f"{a}~{b}={c:+.2f}" for a, b, c in hi))
+    return mf
 
 
 def rolling_metrics(daily, window=252):
@@ -1276,8 +1380,8 @@ def main():
         return
     # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
     # real/regime 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图/复核/regime 拆解用。
-    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib", "nomomentum", "bondstress", "freezetest")))
-    if mode in ("real", "regime", "attrib", "nomomentum", "bondstress", "freezetest"):
+    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest")))
+    if mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest"):
         px, cant_buy, cant_sell = loaded
     else:
         px, cant_buy, cant_sell = loaded, None, None
@@ -1312,6 +1416,9 @@ def main():
         return
     if mode == "attrib":
         run_attribution(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
+        return
+    if mode == "mfat":
+        run_mfattribution(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
     if mode == "nomomentum":
         run_nomomentum(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))

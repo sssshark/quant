@@ -29,6 +29,54 @@ def test_factor_attribution_capm():
     assert abs(a["年化alpha"] - 0.0004 * 252) < 0.04
 
 
+def test_factor_attribution_multi_recovery():
+    """F8: 合成 6 因子数据回收 beta/alpha（n=5000）。px 价格面板列名用真实代码，
+    因子由 _MFACTORS 默认 spec 构造（MKT/SMB/VMG/BND/GLD/NSDQ）。"""
+    rng = np.random.default_rng(42)
+    n = 5000
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    # 6 个原始代码日收益（独立、各异漂移），构造价格面板
+    rets = {c: rng.normal(m, 0.01, n) for c, m in
+            [("510300", 0.0003), ("512100", 0.0004), ("510880", 0.00035),
+             ("511010", 0.0001), ("518880", 0.0002), ("513100", 0.0005)]}
+    px = pd.DataFrame({c: np.cumprod(1 + r) for c, r in rets.items()}, index=idx)
+    # 策略：真日 alpha 0.0003 + 已知 beta 暴露（MKT 0.5 / BND 0.2 / GLD 0.1，其余 0）
+    y = (0.0003 + 0.5 * rets["510300"] + 0.2 * rets["511010"]
+         + 0.1 * rets["518880"] + rng.normal(0, 0.005, n))
+    a = e.factor_attribution_multi(pd.Series(y, index=idx), px)
+    assert a is not None
+    assert abs(a["betas"]["MKT"] - 0.5) < 0.03
+    assert abs(a["betas"]["BND"] - 0.2) < 0.03
+    assert abs(a["betas"]["GLD"] - 0.1) < 0.03
+    assert abs(a["alpha_ann"] - 0.0003 * 252) < 0.04
+
+
+def test_mfat_strips_spurious_alpha():
+    """F8 核心论点：真 alpha=0 但有债券/黄金 beta → CAPM 算出假阳性 alpha，多因子剥回近 0。
+    证明「多因子能剥离 CAPM 误判为 alpha 的非权益 beta」——本条改进的存在理由。
+    市场均值压低（驱动 CAPM 假阳性的只有债/金漂移），消减截距 SE 的均值杠杆。"""
+    rng = np.random.default_rng(7)
+    n = 5000
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    rm = rng.normal(0.00010, 0.011, n)      # 市场：低均值（截距 SE 不被均值杠杆放大）
+    rb = rng.normal(0.00030, 0.002, n)      # 国债：正漂移 ~7.5%/yr（驱动假 CAPM α）
+    rg = rng.normal(0.00040, 0.007, n)      # 黄金：正漂移 ~10%/yr（驱动假 CAPM α）
+    rnoise = {c: rng.normal(0, 0.01, n) for c in ["512100", "510880", "513100"]}
+    px = pd.DataFrame({c: np.cumprod(1 + r) for c, r in
+                       {"510300": rm, "511010": rb, "518880": rg, **rnoise}.items()}, index=idx)
+    y = 0.3 * rm + 0.4 * rb + 0.2 * rg + rng.normal(0, 0.002, n)   # 真 alpha=0
+    daily = pd.Series(y, index=idx)
+    # ① CAPM（只对市场回归）→ alpha 显著 > 0（债/金正漂移被误读成 alpha）
+    capm = e.factor_attribution(daily, pd.Series(rm, index=idx))
+    assert capm["年化alpha"] > 0.025
+    # ② 多因子 → alpha 近 0（债/金暴露被 BND/GLD 因子 beta 吸收）；并明确剥离了 ≥1pp 假 α
+    mf = e.factor_attribution_multi(daily, px)
+    assert abs(mf["alpha_ann"]) < 0.02
+    assert mf["alpha_ann"] < capm["年化alpha"] - 0.01
+    assert abs(mf["betas"]["BND"] - 0.4) < 0.03
+    assert abs(mf["betas"]["GLD"] - 0.2) < 0.03
+
+
 def test_sortino_clamp():
     """F1: 全正收益 → 下行偏差=0 → Sortino 钳极大。"""
     pos = pd.Series([0.001] * 200, index=pd.date_range("2020-01-01", periods=200, freq="B"))
