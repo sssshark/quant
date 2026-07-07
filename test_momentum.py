@@ -249,6 +249,27 @@ def test_qfq_from_pre_close():
     assert abs(adj.iloc[1] - adj.iloc[2]) < 1e-9         # 除权日无跳变(adj[1]=8, adj[2]=8)
 
 
+def test_multi_k1_equivariance():
+    """阶段1 不变量:单策略等权组合(K=1)经 strategy 路径的 NAV ==
+    decide_targets 直连路径的 NAV。证明重构只换壳不换行为。
+    合成价格(7 POOL + 国债, 600 营业日含月末调仓), 同配置两路径 NAV 逐点相等。
+    另验 K=2 叠加自身(两个相同 CTA 等权)== 单 CTA(权重各自减半, 合并=原)。"""
+    from multi_strategy import CTAStrategy, MultiStrategy
+    rng = np.random.default_rng(3)
+    cols = list(mc.POOL) + [mc.DEFENSE[0]]
+    idx = pd.date_range("2018-01-01", periods=600, freq="B")
+    px = pd.DataFrame({c: 100 * np.cumprod(1 + rng.normal(0.0003 + i * 0.0001, 0.011, len(idx)))
+                       for i, c in enumerate(cols)}, index=idx)
+    cfg = dict(vol_target=mc.VOL_TARGET, trend_ma=mc.TREND_MA, hold_all=True)
+    nav0, ret0, _, _ = e.backtest(px, **cfg)                       # 直连路径(decide_targets)
+    multi = MultiStrategy([CTAStrategy(**cfg)])
+    nav1, ret1, _, _ = e.backtest(px, strategy=multi)              # 策略路径(K=1)
+    assert np.allclose(nav0.values, nav1.values, atol=1e-9)        # K=1 逐点守恒
+    multi2 = MultiStrategy([CTAStrategy(**cfg), CTAStrategy(**cfg)])
+    nav2, _, _, _ = e.backtest(px, strategy=multi2)                # K=2 两个相同 CTA 等权
+    assert np.allclose(nav1.values, nav2.values, atol=1e-9)        # K=2 合并 == 单 CTA
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

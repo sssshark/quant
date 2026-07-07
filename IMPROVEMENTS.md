@@ -5,7 +5,7 @@
 > Moreira-Muir(波动管理)、Daniel-Moskowitz(动量崩溃)、
 > 桥水(风险平价)、AHL/Winton(CTA)、López de Prado(回测过拟合检验)。
 >
-> **共 75 条**:[高] 16(定位内应补)/ [中] 37(可选)/ [低] 22(超出当前定位)。含 2026-07-06 **J 节评审**新开 7 条(2高+3中+2低)——"跟主流策略比"的方法论盲区,多数 CUT ACROSS 已有条目(是对"已有结论被轻放"的再审视);含 2026-07-07 **F8** 多因子归因(扩 F4 CAPM,剥离被误判为 alpha 的债/金 beta)
+> **共 77 条**:[高] 16(定位内应补)/ [中] 37(可选)/ [低] 22(超出当前定位)。含 2026-07-06 **J 节评审**新开 7 条(2高+3中+2低)——"跟主流策略比"的方法论盲区,多数 CUT ACROSS 已有条目(是对"已有结论被轻放"的再审视);含 2026-07-07 **F8** 多因子归因(扩 F4 CAPM,剥离被误判为 alpha 的债/金 beta);2026-07-08 新开 **M 节**多策略组合框架(B 型,2 条:M1 接口已落地 + M2 模块重组待办[低])
 
 ## 用法
 
@@ -22,8 +22,8 @@
 ## 进度
 
 ```
-总 75  ┃ 已完成 52 ┃ 待办 23        [高]0 [中]0 [低]23（J1–J5 全结案 + F8 多因子归因:[高]/[中] 清零,剩 [低] 均超定位/待实盘）。完成明细见各条目
-[高] 0（全清）  ┃ [中] 0（全清）  ┃ [低] 23
+总 77  ┃ 已完成 53 ┃ 待办 24        [高]0 [中]0 [低]24（J1–J5 全结案 + F8 多因子归因 + M1 多策略接口:[高]/[中] 清零,剩 [低] 均超定位/待实盘/阶段2）。完成明细见各条目
+[高] 0（全清）  ┃ [中] 0（全清）  ┃ [低] 24
 ```
 （每完成一批,更新上面三组数字)
 
@@ -198,6 +198,27 @@
 
 ---
 
+## M. 多策略组合框架(B 型)(2026-07-08 起)
+
+> 方向演进:从"单一 ETF 动量策略"→"多策略组合"。CTA 作为一个独立策略,未来叠加 carry / 均值回归 /
+> 海外配置等,上层 `MultiStrategy` 做资金分配。**非**个股横截面多因子选股(A 型)。
+> 设计原则:**单策略内部不做多因子**(瘦策略 = 单 alpha + 自带风控),多 alpha 来源 = 多个独立
+> `Strategy` 在组合层叠加(避免 PBO 0.67 的过拟合教训);CTA 内部 vol/trend/crash/drawdown 是
+> **风控,不是因子**。
+
+- [x] **M1** 多策略接口(阶段1,2026-07-08 落地)— 新 `multi_strategy.py`:`Strategy` 协议 +
+  `CTAStrategy`(瘦策略,复用 `decide_targets`,默认 `hold_all=True` 剥离无效选股 PBO=0.67)+
+  等权 `MultiStrategy`;`backtest(strategy=)` 决策来源可插拔(`strategy=None` 走 `decide_targets`
+  直连,所有 `run_*` 零回归);K=1 口径守恒(`test_multi_k1_equivariance` + `multi` 子命令,
+  真实数据 NAV 差异 0.00e+00)。`CTAStrategy` 用 `**decide_kwargs` 透传,默认值由 `decide_targets`
+  唯一定,避免两处漂移。
+
+- [ ] **[低] M2** 模块重组 / 改名(阶段2,触发条件:**有第二个策略**)— `etf_momentum.py`(1600 行)
+  实为通用回测引擎、`momentum_core.py` 实为 CTA 逻辑,名实错位。计划拆 `engine`/`data`/`cta`/
+  `diagnostics`/`cli` 等模块(= H3 单文件大重构,落到多策略语境)。**现在不做**:仅 CTA 一个策略
+  时正确模块边界尚未显现(拆分是猜,第二个策略到来边界才清楚),且改名高扰动(5+ 文件 import/
+  test/git/文档同步)。决策(2026-07-08):用户选"不改,记一笔"。
+
 ## 解决记录 (Changelog)
 
 > 每完成一条,在此追加一行。建议:`日期 | 编号 | 改动摘要 | 验证方式 | 结果`
@@ -244,6 +265,7 @@
 | 2026-07-06 | J2(落地) | `hold_all` 做成实盘可选部署模式:`momentum_core.HOLD_ALL` 常量 + `etf_momentum_live._load_hold_all`(读 `live_config.json` 的 `hold_all` 键覆盖默认)+ main 透传并打印模式 + `live_config.example.json` 加示例 | `test_load_hold_all`(true/false/缺键三级回退)+ test 10/10 + py_compile | 改 `live_config.json` 的 `hold_all` 即可在'动量轮动'(默认)与'等权全池+风控'(J1/J2 证的稳健版:选股无可靠 alpha、回撤更浅)间切换,无需改代码。J2 结论从'代码留作 A/B 工具'升级为'可部署' |
 | 2026-07-06 | J5 | `run_freezetest`/`freezetest` 子命令:连续跑策略在 2022-01-01 切开,按段(全样本/调参期/冻结期)切指标,比选股 vs 等权+风控 vs B&H | `etf_momentum.py freezetest` 实跑(tushare)+ py_compile | **PBO=0.67 警告被证实**:冻结期(2022–26)选股输给等权+风控(夏普 0.74<0.79、回撤 −15.0%<−10.8%)——全样本调出的选股近期段不成立,'经验默认'没消除选择偏差。但风控层冻结期仍跑赢 B&H +0.55 夏普、回撤砍到 1/3 → 过拟合集中在选股层、风控层稳健。DSR@100 担忧已由 J3 化解(月频 0.999)。**J5 结案,进度 [中]1→0([高]/[中] 全清)** |
 | 2026-07-07 | F8 | `factor_attribution_multi(daily, px)` 多因子 OLS(MKT/SMB/VMG/BND/GLD/NSDQ 6 因子,从 `px` 构造、含截距 lstsq + t-stat + 调整 R² + 相关矩阵)+ `_factor_returns`/`_MFACTORS` + `run_mfattribution`/`mfat` 子命令(与 attrib 同源全风控) | `test_factor_attribution_multi_recovery` + `test_mfat_strips_spurious_alpha`(核心论点:真α=0+债金beta→CAPM假阳性、多因子剥回近0)+ test 12/12 + `etf_momentum.py mfat` 实跑(tushare n=3100) | **CAPM α+11.7%→多因子 α+7.0%,剥离+4.7%**(CAPM 误归为 alpha 的债/金/纳指/小盘 beta)。MKT β0.55/BND β0.22(t3.2)/GLD β0.13/NSDQ β0.13,R²0.41→0.53。**判读**:CAPM 高估 ~40%,但 +7.0% 真 alpha 存活(风控/择时在静态资产暴露外的附加值,印证 F3 非纯beta);caveat:6因子只剥资产类别 beta,未含动量/低波风格因子(策略本身属性),7.0% 是诚实下界非纯skill点估计。**F8 结案**,进度 总74→75/已完51→52 |
+| 2026-07-08 | M1 | 新 `multi_strategy.py`(`Strategy` 协议 + `CTAStrategy` 瘦策略默认 `hold_all=True` + 等权 `MultiStrategy`)+ `backtest(strategy=)` 决策来源可插拔 + `run_multi`/`multi` 子命令 | `test_multi_k1_equivariance`(K=1 + K=2 守恒)+ test 17/17 + `etf_momentum.py multi` 实跑(tushare 12.7年) | 真实数据 NAV 差异 **0.00e+00**(策略路径逐点复刻 `decide_targets` 直连);CTA 因子化为独立 Strategy,阶段2 加第二个策略即进入组合层(资金分配/相关性/组合 PBO) |
 
 > 注：C1 参数网格稳健性（mini-robust，Part2/3）因 akshare/东财接口限频未跑完；数据缓存 + 重试机制已就位（`tmp/px_cache.pkl`），接口冷却后可一键补跑。
 

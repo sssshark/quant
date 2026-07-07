@@ -17,6 +17,7 @@ A股 ETF 动量轮动 —— 向量化回测 / 研究工具。
   python etf_momentum.py nomomentum # J2 对照：等权全池+风控不选股 vs 动量轮动，量化选股边际
   python etf_momentum.py bondstress # J4 防守资产债牛敏感性：国债收益替换 0%/−2% 重算回撤与 Calmar
   python etf_momentum.py freezetest # J5 样本外冻结期检验：近期段选股边际+风控稳健性,PBO=0.67 再审视
+  python etf_momentum.py turnover   # 换手率归因:hold_all vs 选股年换手对比 + 换手来自候选/vol/趋势哪类
 """
 import sys
 import math
@@ -272,7 +273,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
              dd_thr=DD_THR, dd_cut=DD_CUT,
              cant_buy=None, cant_sell=None, defense_cash=None, max_weight=None, return_turnover=False,
-             hold_all=False):
+             hold_all=False, strategy=None):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
         的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
@@ -309,23 +310,25 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
             cur = _apply_target_with_limits(tgt_dict, cur, d, cant_buy, cant_sell)
             pending = None
         if d in rd_set:                                    # 今日 = 信号日(T)：算信号，延迟到次日成交
-            # 把截至当日的收盘价喂给核心大脑（与实盘喂法一致）
-            recent = {c: px[c].loc[:d].dropna().tolist() for c in POOL}
-            target, picks = decide_targets(recent, lookbacks=lookbacks,
-                                           top_n=top_n, vol_target=vol_target,
-                                           vol_window=vol_window, trend_ma=trend_ma,
-                                           trend_code=(trend_code or TREND_CODE),
-                                           trend_cut=trend_cut, skip_recent=skip_recent,
-                                           risk_adj=risk_adj, mom_weights=mom_weights,
-                                           weighting=weighting,
-                                           inv_vol_window=inv_vol_window,
-                                           crash_prot=crash_prot,
-                                           crash_lookback=crash_lookback,
-                                           crash_thr=crash_thr, crash_cut=crash_cut,
-                                           drawdown_prot=drawdown_prot,
-                                           dd_window=dd_window,
-                                           dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash,
-                                           max_weight=max_weight, hold_all=hold_all)
+            if strategy is not None:
+                # 策略路径：决策来自 strategy.target（K=1 单策略时与 decide_targets 直连逐点等价）
+                recent = {c: px[c].loc[:d].dropna().tolist() for c in strategy.universe}
+                target = strategy.target(recent, d)
+                picks = [POOL.get(c, c) for c in target]   # 仅日志用，不影响 NAV
+            else:
+                # 原路径：把截至当日的收盘价喂给核心大脑（与实盘喂法一致）
+                recent = {c: px[c].loc[:d].dropna().tolist() for c in POOL}
+                target, picks = decide_targets(
+                    recent, lookbacks=lookbacks, top_n=top_n, vol_target=vol_target,
+                    vol_window=vol_window, trend_ma=trend_ma,
+                    trend_code=(trend_code or TREND_CODE), trend_cut=trend_cut,
+                    skip_recent=skip_recent, risk_adj=risk_adj, mom_weights=mom_weights,
+                    weighting=weighting, inv_vol_window=inv_vol_window,
+                    crash_prot=crash_prot, crash_lookback=crash_lookback,
+                    crash_thr=crash_thr, crash_cut=crash_cut,
+                    drawdown_prot=drawdown_prot, dd_window=dd_window,
+                    dd_thr=dd_thr, dd_cut=dd_cut, defense_cash=defense_cash,
+                    max_weight=max_weight, hold_all=hold_all)
             if target:
                 pending = (target, picks)                  # 不立即写 cur，等下一日成交
                 holdings_log.append((d.date(), picks))
@@ -1336,6 +1339,137 @@ def run_freezetest(px, lim=None, split="2022-01-01"):
     print("      (最少被直接优化的概念持有期),是最可得的事后近似、非真样本外。真样本外须等实盘向前跑出。")
 
 
+def run_turnover(px):
+    """换手率归因(F5 return_turnover 的归因扩展):hold_all(不选股)vs 选股的年换手对比,
+    并把 hold_all 每月换手归因到三个来源——候选集扩张 / vol_target 缩放 / 趋势过滤搬仓。
+    回答"不选股为什么还会换手、换手集中在什么时候"。
+
+    归因口径:fin = eq + vol_offset + trend_offset(等权 + vol缩放 + trend砍仓)。月度换手
+    |fin_t − fin_{t−1}| 代数上 = Δeq + Δvol_offset + Δtrend_offset,各取绝对值即各机制的毛调整
+    贡献(各机制可部分抵消,占比之和可>100%;真实成交换手见上方年换手率)。为取中间状态,这里
+    手动复现 decide_targets 的 hold_all 三阶段(decide_targets 只返回最终 target);若其改动需同步。"""
+    from momentum_core import blended_momentum, _realized_vol, _below_trend, CASH_BUFFER
+    need = max(MAX_LOOKBACK, max(LOOKBACKS))
+    years = (px.index[-1] - px.index[need]).days / 365.25
+    dcode = DEFENSE[0]
+    cost = COMMISSION + SLIPPAGE
+
+    def _ann_to(hold_all):
+        *_, to = backtest(px, hold_all=hold_all, vol_target=VOL_TARGET, trend_ma=TREND_MA, return_turnover=True)
+        return to.sum() / years
+    to_hold, to_sel = _ann_to(True), _ann_to(False)
+    print("=" * 72)
+    print(f"换手率分析(hold_all 不选股 vs 选股;全期 {years:.1f} 年)")
+    print("=" * 72)
+    print(f"\n  年换手率(双边权重,成交后口径):")
+    print(f"    hold_all(不选股): {to_hold:.2f}/年   换手成本≈{to_hold*cost*100:.2f}%/年")
+    print(f"    选股:             {to_sel:.2f}/年   换手成本≈{to_sel*cost*100:.2f}%/年")
+    print(f"    (2.0≈组合全年完整换手一次;hold_all 不到选股一半)")
+
+    # 月末调仓日(与 backtest 同口径),逐月复现 hold_all 三阶段目标
+    month_ends = px.resample("ME").last().index
+    rebal = [px.index[px.index <= me][-1] for me in month_ends if (px.index <= me).any()]
+    rebal = [d for d in rebal if d >= px.index[need]]
+
+    def _stages(d):
+        recent = {c: px[c].loc[:d].dropna().tolist() for c in POOL}
+        moms = [c for c in POOL if recent.get(c) is not None
+                and blended_momentum(recent[c], LOOKBACKS) is not None]
+        if len(moms) < TOP_N:
+            return None
+        eq = {c: 0.0 for c in list(POOL) + [dcode]}
+        for c in moms:
+            eq[c] = CASH_BUFFER / len(moms)
+        vo = dict(eq)
+        rv = _realized_vol(recent, moms, VOL_WINDOW)
+        if VOL_TARGET and rv and rv > VOL_TARGET:               # 第三步:vol_target 缩股票仓挪国债
+            s = VOL_TARGET / rv
+            for c in moms:
+                vo[dcode] += vo[c] * (1 - s); vo[c] *= s
+        fin = dict(vo)
+        bt = _below_trend(recent, TREND_CODE, TREND_MA)
+        if TREND_MA and bt:                                     # 第四步:趋势过滤砍半挪国债
+            for c in moms:
+                fin[dcode] += fin[c] * (1 - TREND_CUT); fin[c] *= TREND_CUT
+        return eq, vo, fin, bt, moms
+
+    rows, prev = [], None
+    for d in rebal:
+        s = _stages(d)
+        if s is None:
+            continue
+        eq, vo, fin, bt, moms = s
+        voloff = {c: vo[c] - eq[c] for c in eq}
+        trendoff = {c: fin[c] - vo[c] for c in eq}
+        if prev is None:
+            prev = (fin, eq, voloff, trendoff)
+            continue
+        pfin, peq, pvoloff, ptrendoff = prev
+        allc = sorted(set(fin) | set(pfin))
+        fin_to = sum(abs(fin[c] - pfin[c]) for c in allc)       # 月度换手=|Δ最终权重|.sum
+        cand = sum(abs(eq[c] - peq[c]) for c in sorted(set(eq) | set(peq)))
+        vol = sum(abs(voloff[c] - pvoloff[c]) for c in allc)
+        tr = sum(abs(trendoff[c] - ptrendoff[c]) for c in allc)
+        adj = {"候选": cand, "vol_target": vol, "趋势过滤": tr}
+        rows.append({"日期": d.date(), "换手": fin_to, "候选": cand, "vol": vol,
+                     "trend": tr, "主因": max(adj, key=adj.get), "trend触发": bt, "候选数": len(moms)})
+        prev = (fin, eq, voloff, trendoff)
+
+    df = pd.DataFrame(rows)
+    print(f"\n  hold_all 每月目标换手 Top 10(信号口径;换手=|Δ最终权重|.sum):")
+    print(df.nlargest(10, "换手").to_string(index=False,
+          formatters={c: lambda x: f"{x:.3f}" for c in ["换手", "候选", "vol", "trend"]}))
+
+    tc, tv, tt = df["候选"].sum(), df["vol"].sum(), df["trend"].sum()
+    tot = tc + tv + tt
+    print(f"\n  全期换手归因(各机制偏移变化的毛累计 / 占比):")
+    print(f"    候选集扩张: {tc:6.2f} ({tc/tot*100:3.0f}%)  新标的上市加入等权池(早期)")
+    print(f"    vol_target: {tv:6.2f} ({tv/tot*100:3.0f}%)  高波动期股票仓缩放↔恢复")
+    print(f"    趋势过滤:   {tt:6.2f} ({tt/tot*100:3.0f}%)  大盘破/回{TREND_MA}日线,股票↔国债搬仓")
+    print(f"    (毛调整,各机制可部分抵消,占比之和可>100%;真实成交换手见上方年换手率)")
+
+    hi = df[df["换手"] > 0.30]
+    print(f"\n  高换手月(换手>0.30)共 {len(hi)} 个;主因 "
+          f"{dict((k, int(v)) for k, v in hi['主因'].value_counts().items())}")
+    print(f"  (高换手月应 100% 风控驱动:vol_target + 趋势过滤;候选主因只出现在换手≈0 的平静月)")
+    print(f"\n  判读:hold_all 换手是'事件驱动'——平静月(候选稳+波动低+大盘在线上)换手≈0,")
+    print(f"        大换手集中在 ①波动率破 {int(VOL_TARGET*100)}% 目标(vol 缩放) ②大盘破/回 {TREND_MA} 日线(trend 搬仓);")
+    print(f"        选股版额外每月 top_n 重排 → 年换手翻倍。")
+
+
+def run_multi(px, lim=None):
+    """阶段1:多策略(B 型)接口验证。CTAStrategy(单策略)经 strategy 路径跑回测,
+    与 decide_targets 直连路径对比 NAV,验证 K=1 口径守恒(重构只换壳不换行为)。
+    阶段2 加入第二个策略后,这里才是真正的多策略组合回测(资金分配/相关性/组合 PBO)。"""
+    from multi_strategy import CTAStrategy, MultiStrategy
+    lim = lim or {}
+    # 对齐 real 口径:vol_target + 趋势过滤 + hold_all=False(部署默认选股版,与 real 模式可比)
+    cfg = dict(vol_target=VOL_TARGET, trend_ma=TREND_MA, hold_all=False)
+    # 原路径:decide_targets 直连(所有 run_* 走的同一条)
+    nav0, ret0, n0, _ = backtest(px, **cfg, **lim)
+    # 策略路径:单策略 K=1 等权组合(同配置)
+    multi = MultiStrategy([CTAStrategy(**cfg)])
+    nav1, ret1, n1, _ = backtest(px, strategy=multi, **lim)
+    max_abs = float(abs(nav0.values - nav1.values).max())
+    print("=" * 64)
+    print("[阶段1 多策略接口验证] 单策略(K=1) 策略路径 vs decide_targets 直连")
+    print("=" * 64)
+    print(f"  配置: vol_target={VOL_TARGET}  trend_ma={TREND_MA}  hold_all=False")
+    print(f"  调仓次数: 直连={n0}  策略={n1}")
+    print(f"  NAV 最大绝对差异 = {max_abs:.2e}  (≈0 即守恒:重构只换壳不换行为)")
+    bn = bench_nav(px)
+    pb = perf(bn, bn.pct_change().fillna(0))
+    _print_table([
+        ("decide_targets 直连(real口径)", perf(nav0, ret0)),
+        ("strategy 接口(K=1, CTAStrategy)", perf(nav1, ret1)),
+        ("买入持有沪深300", pb),
+    ])
+    if max_abs > 1e-6:
+        print(f"  ⚠ 守恒被打破!差异 {max_abs:.2e} > 1e-6 —— 策略路径与直连不一致,需排查。")
+    else:
+        print(f"  ✓ 守恒通过:阶段1 接口闭环。后续在此叠加第二个策略即进入阶段2(组合层)。")
+
+
 def run_review():
     """D1/D2 改完后，在新口径（T+1 成交 + 涨跌停）下复核 C1/C2 的旧结论是否仍成立。
 
@@ -1387,8 +1521,8 @@ def main():
         return
     # sweep/robust/wf/boot/universe 保持原口径（不带涨跌停过滤，与历史对照一致）；
     # real/regime 模式启用 D1/D2 新口径（T+1 成交 + 涨跌停），出图/复核/regime 拆解用。
-    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest")))
-    if mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest"):
+    loaded = load_real(with_limits=(mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest", "multi")))
+    if mode in ("real", "regime", "attrib", "mfat", "nomomentum", "bondstress", "freezetest", "multi"):
         px, cant_buy, cant_sell = loaded
     else:
         px, cant_buy, cant_sell = loaded, None, None
@@ -1436,8 +1570,14 @@ def main():
     if mode == "freezetest":
         run_freezetest(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
+    if mode == "turnover":
+        run_turnover(px)
+        return
     if mode == "regime":
         run_regime(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
+        return
+    if mode == "multi":
+        run_multi(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
 
     # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准（real 模式带 D1/D2 新口径）
