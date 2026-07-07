@@ -13,6 +13,8 @@
   - 需先在华泰开通 miniQMT/极简模式权限，并让 QMT 客户端在后台登录运行。
   - 实盘凭证（QMT_PATH / ACCOUNT_ID）不写进代码：从「环境变量 > 本地 live_config.json」
     读取（见 _load_live_secret），配置方法见 live_config.example.json。
+  - 实盘建议 hold_all=true（等权全池+风控）：研究证明动量选股无可靠 alpha、跨市场甚至显著拖累
+    （J1/J2/J5/G3，详见 IMPROVEMENTS）。默认 hold_all=false 仅作策略展示；改 live_config.json 即可切换。
   - 真金白银交易请你本人确认后执行；建议先在模拟账户跑通。
   - 程序化交易需按交易所要求报备。
 
@@ -325,6 +327,11 @@ def main():
     hold_all = _load_hold_all()
     mode_name = "等权全池+风控(不选股,J1/J2 稳健版)" if hold_all else "动量轮动(top3+绝对动量)"
     print(f"[模式] {mode_name}")
+    if not hold_all:
+        print("[⚠ 实盘建议] 当前为动量选股模式。项目研究(J1/J2/J5/G3)证明:动量选股相对'等权全池+风控'")
+        print("            无可靠 alpha(A股 bootstrap P=0.148、美股 P=0.999 显著为负)、PBO=0.67 过拟合、")
+        print("            冻结期选股夏普 0.74 < 等权+风控 0.79。真金白银实盘建议 hold_all=true,")
+        print("            改 live_config.json 的 hold_all 为 true 即可。详见 IMPROVEMENTS J1/J2/J5。")
     target, names = decide_targets(recent, trend_ma=TREND_MA, hold_all=hold_all)
     print(f"[{BROKER}] 调仓日:", dt.date.today(), " 目标持有:", names or "（可选标的不足，空仓）")
     if not target:

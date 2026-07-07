@@ -35,15 +35,9 @@ from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
 
 ALL_CODES = list(POOL) + [DEFENSE[0]]
 
-# 已知 tushare 源数据永久断层（fund_daily 价格跳变、但无对应分红/拆分记录，无法从 tushare 修复）。
-# _load_via_tushare 截断断层前的数据（保留与近期价格连续的一侧），避免伪日收益（如 +248%）污染回测。
-# 代价：这些 ETF 的早期历史丢失（513100 纳指丢 2013-2021 等）。未来若接入东财（adjust=qfq 能正确
-# 处理拆分）可恢复。详见 IMPROVEMENTS E3/E4 与解决记录。
-_SOURCE_SHIFT = {
-    "510500": "2015-04-15",   # 中证500：~2 → ~8（断层前价格源错误）
-    "512100": "2022-09-05",   # 中证1000：~1 → ~2.7
-    "513100": "2022-01-14",   # 纳指：~5 → ~1（疑似拆分无记录）
-}
+# 历史遗留：曾用 _SOURCE_SHIFT 显式截断 tushare 源的价格断层（510500/512100/513100 等），
+# 该方案已被 _load_via_tushare 的 pre_close 对齐前复权法替代（能正确处理份额拆分、且恢复了这些
+# ETF 的早期历史）。字典已删除；前复权原理见 _qfq_from_pre_close。详见 IMPROVEMENTS E3/E4。
 
 
 # ---------------- 数据 ----------------
@@ -61,6 +55,23 @@ def load_real(with_limits=False):
     px = res[0] if isinstance(res, tuple) else res
     _data_quality_guard(px)          # E4：清洗后仍残留的不可成交伪迹大声告警
     return res
+
+
+def _qfq_from_pre_close(close, pre_close):
+    """前复权（pre_close 对齐法，改进项 E3）：用 pre_close 列对齐除权/拆分，统一处理现金分红与份额拆分。
+
+    替代旧 fund_div + _SOURCE_SHIFT 方案（两缺陷：① fund_div 不记录份额拆分，致拆分日 close 断崖
+    漏过复权；② _SOURCE_SHIFT 把"pre_close 准但 close 断点"误判为源永久断层、过度截断丢早期历史）。
+    实测 pre_close 对除权/拆分准确：涨跌停时 pre_close=昨收，仅除权/拆分时 pre_close≠close[t-1]。
+      f[t] = pre_close[t] / close[t-1]        （偏离 1 = 除权/拆分）
+      g[i] = ∏_{t≥i} f[t]
+      adj[i] = close[i] × ∏_{t>i} f[t] = close[i] × g.shift(-1)   （最新价 = close 末值不变）
+    close / pre_close：同 index 的 pandas Series（未复权）；返回前复权 Series。纯函数，可单测（test_qfq）。
+    """
+    prev = close.shift(1)
+    f = (pre_close / prev).fillna(1.0)            # f[t]=pre_close[t]/close[t-1]；偏离 1 = 除权/拆分
+    g = f[::-1].cumprod()[::-1]                  # g[i]=∏_{t≥i}f[t]
+    return close * g.shift(-1).fillna(1.0)        # adj[i]=close[i]×∏_{t>i}f[t]，最新价=close 末值不变
 
 
 def _load_via_tushare(with_limits=False):
@@ -109,16 +120,9 @@ def _load_via_tushare(with_limits=False):
         raw_d[c] = close
         pre_d[c] = fd["pre_close"].astype(float) if "pre_close" in fd else close.shift(1)
         time.sleep(0.6)                                    # tushare 限速 100次/分，留余量
-        # 前复权（pre_close 对齐法）：用 pre_close 列对齐除权/拆分，统一处理现金分红与份额拆分，
-        # 替代旧 fund_div + _SOURCE_SHIFT。旧方案两缺陷：① fund_div 不记录份额拆分，致拆分日
-        #   close 断崖（159928/513500/512010 等 -74%）漏过复权；② _SOURCE_SHIFT 把 510500/512100/513100
-        #   "pre_close 准但 close 断点"误判为源永久断层、过度截断（513100 丢 2013-2021 整段）。
-        #   实测 pre_close 对除权/拆分准确（close/pre_close 全期 max|ret|≤10%）：涨跌停时 pre_close=昨收，
-        #   仅除权/拆分时 pre_close≠close[t-1]。因子 f[t]=pre_close[t]/close[t-1]，前复权 adj[i]=close[i]×∏_{t>i}f[t]。
-        prev = close.shift(1)
-        f = (pre_d[c] / prev).fillna(1.0)            # f[t]=pre_close[t]/close[t-1]；偏离 1 = 除权/拆分
-        g = f[::-1].cumprod()[::-1]                  # g[i]=∏_{t≥i}f[t]
-        adj = close * g.shift(-1).fillna(1.0)        # adj[i]=close[i]×∏_{t>i}f[t]，最新价=close 末值不变
+        # 前复权（pre_close 对齐法，详见 _qfq_from_pre_close）：替代旧 fund_div + _SOURCE_SHIFT，
+        # 能正确处理份额拆分、且恢复了 510500/512100/513100 的早期历史。
+        adj = _qfq_from_pre_close(close, pre_d[c])
         adj.name = c
         series[c] = adj
     px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
@@ -413,7 +417,7 @@ def factor_attribution(daily, bench_daily):
 
 
 # F8 多因子归因的因子定义（全部从已加载的 px 面板构造，无需外部因子数据）。
-# tushare 的 _SOURCE_SHIFT 是死代码（pre_close 法已恢复 512100/513100/518880 早期历史），6 因子全可用。
+# pre_close 前复权法已恢复 512100/513100/518880 的早期历史，6 因子全可用（无需外部因子数据）。
 # 单代码 = 该资产日收益；(c1, c2) = 零投资 spread = r(c1) − r(c2)。
 _MFACTORS = [
     ("MKT",  BENCH),                  # 沪深300 市场（CAPM 已有的市场因子）
@@ -562,13 +566,16 @@ def _print_table(rows):
 
 # ---------------- 主流程 ----------------
 def run_sweep(px):
-    print("参数稳健性扫描（年化% / 最大回撤% / 夏普）:\n")
+    # 与部署口径一致（vol_target + 趋势过滤），否则 sweep 跑的是"无风控"版、其 lookback/top_n 最优
+    # 选择对部署版无效甚至误导。WF_GRID / run_robust 同样显式带 trend_ma=TREND_MA。
+    cfg = dict(vol_target=VOL_TARGET, trend_ma=TREND_MA)
+    print("参数稳健性扫描（全风控口径：vol_target + 趋势过滤；年化% / 最大回撤% / 夏普）:\n")
     lb_opts = {"单60日": (60,), "单126日": (126,), "混合1/3/6月": (21, 63, 126), "混合3/6/12月": (63, 126, 252)}
     print(f"{'回看窗口 \\ 持仓数':<18}" + "".join(f"{'TopN='+str(n):>20}" for n in (1, 2, 3)))
     for lname, lb in lb_opts.items(): # lb是回看多少天
         cells = []
         for n in (1, 2, 3):
-            nav, daily, _, _ = backtest(px, lookbacks=lb, top_n=n)
+            nav, daily, _, _ = backtest(px, lookbacks=lb, top_n=n, **cfg)
             p = perf(nav, daily)
             cells.append(f"{p['年化']*100:5.1f}/{p['回撤']*100:6.1f}/{p['夏普']:.2f}")
         print(f"{lname:<18}" + "".join(f"{c:>20}" for c in cells))

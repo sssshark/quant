@@ -189,6 +189,66 @@ def test_crossmarket_globals_swap():
     cm.run_crossmarket(px)                                       # 整条链路(含 bootstrap)不报错
 
 
+def test_apply_target_with_limits_limit_up():
+    """D2 回测可信度核心:目标要新建仓(w>old)但成交日封涨停 → 买不进,维持旧仓。
+    合成 cant_buy 掩码命中,验证 _apply_target_with_limits 跳过加仓;对照不封板则正常落地。"""
+    cols = ["510300", "511010"]
+    cur = pd.Series([0.0, 0.0], index=cols)              # 旧仓空
+    tgt = {"510300": 0.33}                               # 目标:新建沪深300
+    fill_day = pd.Timestamp("2024-01-31")
+    cb = pd.DataFrame(False, index=[fill_day], columns=cols)
+    cb.loc[fill_day, "510300"] = True                    # 当日沪深300 封涨停 → 买不进
+    cs = pd.DataFrame(False, index=[fill_day], columns=cols)
+    new = e._apply_target_with_limits(tgt, cur, fill_day, cb, cs)
+    assert new["510300"] == 0.0                          # 买不进 → 维持旧仓 0
+    new2 = e._apply_target_with_limits(tgt, cur, fill_day,
+                                       pd.DataFrame(False, index=[fill_day], columns=cols), cs)
+    assert abs(new2["510300"] - 0.33) < 1e-9             # 不封板 → 正常落地
+
+
+def test_apply_target_with_limits_limit_down():
+    """D2:旧仓要清掉但成交日封跌停 → 卖不出,维持旧仓;对照不封板则清掉。"""
+    cols = ["510300", "511010"]
+    cur = pd.Series([0.33, 0.0], index=cols)             # 旧仓持有沪深300
+    tgt = {}                                            # 目标:清仓(不在 target)
+    fill_day = pd.Timestamp("2024-01-31")
+    cb = pd.DataFrame(False, index=[fill_day], columns=cols)
+    cs = pd.DataFrame(False, index=[fill_day], columns=cols)
+    cs.loc[fill_day, "510300"] = True                    # 当日沪深300 封跌停 → 卖不出
+    new = e._apply_target_with_limits(tgt, cur, fill_day, cb, cs)
+    assert abs(new["510300"] - 0.33) < 1e-9              # 卖不出 → 维持旧仓
+    new2 = e._apply_target_with_limits(tgt, cur, fill_day, cb,
+                                       pd.DataFrame(False, index=[fill_day], columns=cols))
+    assert new2["510300"] == 0.0                         # 不封板 → 清掉
+
+
+def test_limit_masks():
+    """D2:合成未复权价,验证 cant_buy/cant_sell 掩码——触及涨停价→cant_buy,触及跌停价→cant_sell。"""
+    idx = pd.date_range("2024-01-01", periods=3, freq="B")
+    raw = pd.DataFrame({"510300": [10.0, 11.0, 9.9]}, index=idx)   # day1 +10% 涨停,day2 -10% 跌停
+    pre = pd.DataFrame({"510300": [10.0, 10.0, 11.0]}, index=idx)  # pre_close(正常日=昨收)
+    cb, cs = e.limit_masks(raw, pre)
+    assert bool(cb.loc[idx[1], "510300"]) is True        # day1: close=11≥round(10*1.1,2)=11 → 涨停
+    assert bool(cs.loc[idx[1], "510300"]) is False
+    assert bool(cs.loc[idx[2], "510300"]) is True        # day2: close=9.9≤round(11*0.9,2)=9.9 → 跌停
+    assert bool(cb.loc[idx[2], "510300"]) is False
+    assert bool(cb.loc[idx[0], "510300"]) is False       # day0: 平盘不封板
+    assert bool(cs.loc[idx[0], "510300"]) is False
+
+
+def test_qfq_from_pre_close():
+    """E3 复权:除权日 pre_close≠昨收 → 前复权把历史价格按因子拉回,消除跳变;最新价不变。
+    合成 5 日,day2 除权(昨收 10→今日 pre_close=8、close=8,0.8 因子)。"""
+    idx = pd.date_range("2024-01-01", periods=5, freq="B")
+    close = pd.Series([10.0, 10.0, 8.0, 8.4, 8.82], index=idx)    # day2 除权后正常涨
+    pre = pd.Series([10.0, 10.0, 8.0, 8.0, 8.4], index=idx)       # day2 pre_close=8(≠昨收 10)=除权基准
+    adj = e._qfq_from_pre_close(close, pre)
+    assert abs(adj.iloc[0] - 8.0) < 1e-6                 # day0~1 被回溯因子 0.8 拉回:10*0.8=8
+    assert abs(adj.iloc[1] - 8.0) < 1e-6
+    assert abs(adj.iloc[-1] - close.iloc[-1]) < 1e-9     # 最新价 = close 末值不变
+    assert abs(adj.iloc[1] - adj.iloc[2]) < 1e-9         # 除权日无跳变(adj[1]=8, adj[2]=8)
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":
