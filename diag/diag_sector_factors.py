@@ -14,6 +14,8 @@
 含 COMMISSION+SLIPPAGE。三道关:互补 |corr|<0.3 + 自身夏普>0.5 + 组合增益 50/50>max。
 语境基准:等权 B&H(夏普 0.26)——因子策略比它差即说明选股主动亏钱。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import time
 import numpy as np
 import pandas as pd

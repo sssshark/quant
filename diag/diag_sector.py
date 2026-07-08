@@ -22,6 +22,8 @@ B 板块内时序:每个行业各自 blended mom>0 且价>MA200→满仓,否则�
 口径:vectorized 月末调仓、T+2 吃收益(双 shift,对齐 diag_bonds2 / backtest)、含
 COMMISSION+SLIPPAGE。基本盘(CTA+国债 K=2)走 engine.backtest(strategy=…)真口径取日收益。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import os
 import time
 import numpy as np
@@ -49,7 +51,7 @@ START = "20130901"          # 5 行业均已上市的公共起点
 
 def fetch_etf(code, start="20120101"):
     """tushare HTTP 拉单只 ETF 前复权(复用 engine._qfq_from_pre_close,口径同 _load_via_tushare)。"""
-    here = os.path.dirname(__file__)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo 根(找 .tushare_token)
     token = open(os.path.join(here, ".tushare_token"), encoding="utf-8").read().strip()
     api = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
     tc = code + (".SH" if code[0] in "5" else ".SZ")

@@ -18,6 +18,8 @@
 
 判定:与 CTA 近零相关(市场中性应≈0)+ 配对自身正收益 + 组合增益 → 值得探索做空实现路径。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import numpy as np
 import pandas as pd
 from itertools import combinations

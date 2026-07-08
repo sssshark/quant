@@ -14,6 +14,8 @@ risk-parity:权重 ∝ 1/σ_i(波动反比),让每个策略对组合总风险的
   风险平价  ret_rp = w_cta·ret_cta + w_bond·ret_bond,  w_i ∝ 1/σ_i(全样本年化波动)
 配对 circular block bootstrap(block=21≈1月,n=2000):Δ=SR(rp)−SR(eq),p=P(Δ≤0)。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import numpy as np
 import pandas as pd
 

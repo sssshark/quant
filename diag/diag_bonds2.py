@@ -12,6 +12,8 @@
 ⚠ 诊断性质,不落地。预期:债券间高相关(都受利率驱动),分散有限;若多债券≈单只则单只够用(简单优先)。
 公共区间从 511260 上市(2017-08)起,约 9 年。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import os, time
 import numpy as np
 import pandas as pd

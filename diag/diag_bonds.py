@@ -18,6 +18,8 @@ vs CTA 相关性(全样本/分regime)+ 自身绩效 + 50/50 组合增益。
 
 判定:与 CTA 低相关(股债跷跷板)+ 国债策略正收益 + 组合增益 → 国债方向值得扩展多债券。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import numpy as np
 import pandas as pd
 

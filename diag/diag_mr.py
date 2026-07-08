@@ -26,6 +26,8 @@ A股实操约束:ETF 融券几乎不可行 → 不能做空一头 → 经典市�
 注意:这是可行性诊断,非生产策略。MR 参数固定经典值(布林带 20 日、线性逆势映射),
 不调参(避免 PBO 过拟合),只看"够不够互补"这个二阶问题。
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import numpy as np
 import pandas as pd
 

@@ -10,6 +10,8 @@
   ⑤ 沪深300 同复权法 → 方法本身是否给 ~7%(real 报告值)
   ⑥ 因子策略 gross(成本=0) vs net → underperformance 是成本还是选股破坏
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo 根(找 cta/engine/multi_strategy)
 import os
 import time
 import numpy as np
@@ -27,7 +29,7 @@ START = ds.START
 
 def fetch_raw(code, start="20120101"):
     """raw close + pre_close(未复权),同 fetch_etf 的取数但保留 pre_close。"""
-    here = os.path.dirname(__file__)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo 根(找 .tushare_token)
     token = open(os.path.join(here, ".tushare_token"), encoding="utf-8").read().strip()
     api = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
     tc = code + (".SH" if code[0] in "5" else ".SZ")
