@@ -11,6 +11,7 @@
 阶段1 范围:仅 CTA 一个策略,接口闭环 + K=1 口径守恒。资金分配/相关性/组合 PBO
 留给阶段2(等有第二个策略才有意义)。
 """
+import numpy as np
 from typing import Protocol
 
 from momentum_core import decide_targets, POOL, DEFENSE
@@ -128,5 +129,76 @@ class MultiStrategy:
         out = {}
         for s, a in zip(self.strategies, self.allocs):
             for c, w in s.target(recent, t).items():
+                out[c] = out.get(c, 0.0) + a * w
+        return out
+
+
+class RiskParityMulti:
+    """滚动 risk-parity 组合器(阶段2 资金分配)。每月调仓时,用各子策略近 VOL_WINDOW 日
+    已实现波动算权重 w_i ∝ 1/σ_i(波动反比,各策略对组合风险贡献趋均衡)。
+
+    diag_riskparity 实测(2026-07-08):risk-parity 组合夏普 1.91 vs 等权 1.29,配对 block
+    bootstrap Δ=+0.60、P=0.001(高度显著);滚动(无前视)版 1.91 ≈ 静态 1.89(波动比稳定),
+    证明提升非前视幻觉。权重稳定在 CTA~15% / 国债~85%。
+
+    实现:有状态(_prev_targets)。每次 target 用 recent 末尾 VOL_WINDOW 天 + 上期各子策略
+    target,算各子策略「按上期持仓」的近期日收益序列 → σ → risk-parity 权重。用末尾对齐
+    (取所有相关 code 的末尾共同长度)规避 recent 各 code 长度不等(dropna)的错位。历史不足
+    VOL_WINDOW/2 或首次(无上期)退等权。w_i 经 min_weight 钳制、再归一。
+
+    满足 Strategy 接口(组合即策略);universe = 子策略并集。"""
+    def __init__(self, strategies, vol_window=63, min_weight=0.05):
+        n = len(strategies)
+        if n == 0:
+            raise ValueError("RiskParityMulti 至少需要一个策略")
+        self.strategies = strategies
+        self.vol_window = vol_window
+        self.min_weight = min_weight
+        self.name = "RiskParity(" + "+".join(s.name for s in strategies) + ")"
+        self.universe = sorted({c for s in strategies for c in s.universe})
+        self._prev_targets = None          # 上期各子策略 target(算子策略近期收益用)
+
+    def target(self, recent, t):
+        sub = [s.target(recent, t) for s in self.strategies]
+        n = len(self.strategies)
+        if self._prev_targets is None:
+            allocs = [1.0 / n] * n                       # 首次无上期 → 等权
+        else:
+            codes = set()
+            for pt in self._prev_targets:
+                codes |= set(pt.keys())
+            lens = [len(recent[c]) for c in codes if c in recent]
+            if not lens:
+                allocs = [1.0 / n] * n
+            else:
+                L = min(min(lens) - 1, self.vol_window)   # 末尾共同长度(L 个日收益)
+                sigmas = []
+                for ci in range(n):
+                    pt = self._prev_targets[ci]
+                    strat_ret = []
+                    for c, w in pt.items():
+                        arr = recent.get(c)
+                        if arr is None or len(arr) <= L:
+                            continue
+                        tail = arr[-L - 1:]               # L+1 价 → L 个日收益
+                        strat_ret.append([w * (tail[k] / tail[k - 1] - 1.0) for k in range(1, L + 1)])
+                    if strat_ret:
+                        sret = [sum(col) for col in zip(*strat_ret)]   # 各 code 同日求和(末尾对齐)
+                        sigmas.append(float(np.std(sret, ddof=1)) * np.sqrt(252)
+                                      if len(sret) >= self.vol_window // 2 else None)
+                    else:
+                        sigmas.append(None)
+                if any(s is None or s < 1e-9 for s in sigmas):
+                    allocs = [1.0 / n] * n
+                else:
+                    inv = [1.0 / s for s in sigmas]
+                    tot = sum(inv)
+                    allocs = [max(i / tot, self.min_weight) for i in inv]
+                    s2 = sum(allocs)
+                    allocs = [a / s2 for a in allocs]
+        self._prev_targets = sub
+        out = {}
+        for st, a in zip(sub, allocs):
+            for c, w in st.items():
                 out[c] = out.get(c, 0.0) + a * w
         return out

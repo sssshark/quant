@@ -325,6 +325,43 @@ def test_multi_k2_diversification():
     assert vol_k2 < vol_c, f"K=2 波动 {vol_k2:.4f} 未低于单 CTA {vol_c:.4f},分散失效"
 
 
+def test_riskparity_k1_equivariance():
+    """阶段2:RiskParityMulti 单策略(K=1)经 backtest 的 NAV == CTAStrategy 直连。
+    单策略 risk-parity 权重恒为 1(1/σ 归一),故退化成纯 CTA——证明 RiskParityMulti 不破坏 K=1 守恒。"""
+    from multi_strategy import CTAStrategy, RiskParityMulti
+    rng = np.random.default_rng(3)
+    cols = list(mc.POOL) + [mc.DEFENSE[0]]
+    idx = pd.date_range("2018-01-01", periods=600, freq="B")
+    px = pd.DataFrame({c: 100 * np.cumprod(1 + rng.normal(0.0003 + i * 0.0001, 0.011, len(idx)))
+                       for i, c in enumerate(cols)}, index=idx)
+    cfg = dict(vol_target=mc.VOL_TARGET, trend_ma=mc.TREND_MA, hold_all=True)
+    nav0, _, _, _ = e.backtest(px, strategy=CTAStrategy(**cfg))
+    nav1, _, _, _ = e.backtest(px, strategy=RiskParityMulti([CTAStrategy(**cfg)]))
+    assert np.allclose(nav0.values, nav1.values, atol=1e-9), \
+        f"RiskParity K=1 不守恒,max diff={abs(nav0.values - nav1.values).max():.2e}"
+
+
+def test_riskparity_k2_diversification():
+    """阶段2:RiskParityMulti K=2(CTA+国债)跑通,组合年化波动 < 单 CTA
+    (risk-parity 给低波国债高权重,降低组合总风险)。"""
+    from multi_strategy import CTAStrategy, BondMomentumStrategy, RiskParityMulti
+    rng = np.random.default_rng(11)
+    cols = list(mc.POOL) + [mc.DEFENSE[0]]
+    idx = pd.date_range("2016-01-01", periods=700, freq="B")
+    data = {}
+    for c in cols:
+        if c == mc.DEFENSE[0]:
+            data[c] = 100 * np.cumprod(1 + rng.normal(0.0001, 0.003, len(idx)))
+        else:
+            data[c] = 100 * np.cumprod(1 + rng.normal(0.0002, 0.012, len(idx)))
+    px = pd.DataFrame(data, index=idx)
+    cfg = dict(vol_target=mc.VOL_TARGET, trend_ma=mc.TREND_MA, hold_all=True)
+    cta, bond = CTAStrategy(**cfg), BondMomentumStrategy()
+    _, ret_c, _, _ = e.backtest(px, strategy=cta)
+    _, ret_rp, _, _ = e.backtest(px, strategy=RiskParityMulti([cta, bond]))
+    assert ret_rp.std() * np.sqrt(252) < ret_c.std() * np.sqrt(252), "risk-parity 组合波动未低于单 CTA"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

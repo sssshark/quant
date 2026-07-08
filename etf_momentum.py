@@ -1507,6 +1507,23 @@ def run_multi(px, lim=None):
         tag = "  ← 等权(部署默认)" if abs(w - 0.5) < 1e-9 else ""
         print(f"  {w*100:>7.0f}%{pw['年化']*100:>8.1f}%{pw['夏普']:>7.2f}{pw['回撤']*100:>7.1f}%{tag}")
 
+    # ===== risk-parity 资金分配(阶段2):滚动 σ,权重 ∝ 1/σ =====
+    from multi_strategy import RiskParityMulti
+    print()
+    print("=" * 64)
+    print("[阶段2 资金分配] risk-parity(滚动 σ,权重 ∝ 1/σ)vs 等权")
+    print("=" * 64)
+    rp = RiskParityMulti([cta, bond])
+    nav_rp, ret_rp, _, _ = backtest(px, strategy=rp, **lim)
+    _print_table([
+        ("CTA(等权+风控)", perf(nav_cta2, ret_cta2)),
+        ("K=2 等权(50/50)", perf(nav2, ret2)),
+        ("K=2 risk-parity(滚动σ)", perf(nav_rp, ret_rp)),
+    ])
+    print("  (risk-parity 自动给低波国债高权重 ~85%)")
+    print("  ⚠ 概念显著(日频诊断夏普1.91, P=0.001),但月频落地1.45 对等权1.29 不显著(P=0.182)——")
+    print("    月频再平衡滞后吃掉优势 → 默认等权;risk-parity 留作可选(更看重回撤/Sortino 或改日频调仓时)。")
+
 
 def run_review():
     """D1/D2 改完后，在新口径（T+1 成交 + 涨跌停）下复核 C1/C2 的旧结论是否仍成立。
