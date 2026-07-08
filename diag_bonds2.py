@@ -17,9 +17,9 @@ import numpy as np
 import pandas as pd
 import requests
 
-import momentum_core as mc
-import etf_momentum as e
-from etf_momentum import COMMISSION, SLIPPAGE
+import cta as mc
+import engine as e
+from engine import COMMISSION, SLIPPAGE
 
 EXTRA_BONDS = ["511260", "511220"]          # 额外拉(511010 已在 load_real)
 ALL_BONDS = ["511010"] + EXTRA_BONDS        # 中端利率 + 长端利率 + 信用

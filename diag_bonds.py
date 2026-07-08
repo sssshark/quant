@@ -21,9 +21,9 @@ vs CTA 相关性(全样本/分regime)+ 自身绩效 + 50/50 组合增益。
 import numpy as np
 import pandas as pd
 
-import momentum_core as mc
-import etf_momentum as e
-from etf_momentum import DEFENSE, COMMISSION, SLIPPAGE
+import cta as mc
+import engine as e
+from engine import DEFENSE, COMMISSION, SLIPPAGE
 
 BOND = DEFENSE[0]   # "511010" 国债 ETF(池里已有的长债)
 

@@ -23,9 +23,9 @@ J1 跨市场样本外验证 —— 把 A 股动量轮动的"同一套逻辑 + �
 import os
 import contextlib
 
-import momentum_core as mc
-import etf_momentum as e
-from etf_momentum import backtest, perf, bench_nav, _print_table, bootstrap_selection, _boot_report
+import cta as mc
+import engine as e
+from engine import backtest, perf, bench_nav, _print_table, bootstrap_selection, _boot_report
 
 # ---------------- 美股 universe(先验/资产类别驱动,非收益驱动)----------------
 POOL_US = {
@@ -49,7 +49,7 @@ _US_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 def _us_globals():
     """临时把 A 股 POOL/DEFENSE/BENCH 换成美股,跑完恢复。
 
-    backtest 用 etf_momentum 模块全局(POOL/BENCH/DEFENSE);decide_targets 用 momentum_core 全局
+    backtest 用 engine 模块全局(POOL/BENCH/DEFENSE);decide_targets 用 cta 全局
     (POOL/DEFENSE)。两处都要换。trend_code 不能靠改全局——decide_targets 的默认参数在 def 时已绑定,
     必须通过 backtest 的 trend_code 参数显式传(见 run_crossmarket)。"""
     g = e.__dict__

@@ -6,8 +6,8 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import pandas as pd
-import momentum_core as mc
-import etf_momentum as e
+import cta as mc
+import engine as e
 import etf_momentum_live as L
 
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-动量轮动 —— miniQMT 实盘骨架（与回测共用 momentum_core.decide_targets）。
+动量轮动 —— miniQMT 实盘骨架（与回测共用 cta.decide_targets）。
 
 它做的事：
   1. 取最近 N 日收盘价；
@@ -26,7 +26,7 @@ import sys
 import json
 import datetime as dt
 
-from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
+from cta import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
                            TREND_MA, HOLD_ALL, _limit, decide_targets)
 
 # 取数长度要同时够"动量回看"和"大盘趋势均线"两者，取较大值（趋势用 200 日均线 > 126）
@@ -77,7 +77,7 @@ DEMO_TOTAL = 100_000.0                            # 兜底：完全连不上时�
 
 
 def _load_hold_all():
-    """读部署模式 hold_all:live_config.json 的 "hold_all" 键 > momentum_core.HOLD_ALL 默认。
+    """读部署模式 hold_all:live_config.json 的 "hold_all" 键 > cta.HOLD_ALL 默认。
     True = 等权全池+风控(J1/J2 证的稳健版:两市均显示动量选股无可靠 alpha,选股还略抬高回撤);
     False = 动量轮动(默认)。非敏感的策略开关,故只读本地配置文件(不走环境变量)。"""
     cfg = os.path.join(os.path.dirname(__file__), "live_config.json")

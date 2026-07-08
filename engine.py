@@ -2,22 +2,22 @@
 """
 A股 ETF 动量轮动 —— 向量化回测 / 研究工具。
 
-策略逻辑统一来自 momentum_core.decide_targets（与 backtrader 回测、实盘共用一份），
+策略逻辑统一来自 cta.decide_targets（与 backtrader 回测、实盘共用一份），
 这里只负责“喂历史数据 + 算净值 + 出指标/图”，速度快，适合调参研究。
 
 运行:
-  python etf_momentum.py            # 真实数据：改进版 vs 无风控版 vs 基准 + 出图
-  python etf_momentum.py sweep      # 参数稳健性扫描（不同回看窗口/持仓数）
-  python etf_momentum.py robust     # 单参数扰动稳健性（看是不是"平台"，查过拟合）
-  python etf_momentum.py wf         # walk-forward 滚动样本外（量化样本外夏普衰减）
-  python etf_momentum.py boot       # RISK_ADJ 夏普提升的 bootstrap 显著性检验
-  python etf_momentum.py bootmom    # A2 混合动量加权 的 A/B + bootstrap 显著性检验
-  python etf_momentum.py dsr        # G1 Deflated Sharpe：多重比较下的夏普可信度
-  python etf_momentum.py universe   # 标的池消融：踢掉黄金/纳指，量化 alpha 对池子的依赖
-  python etf_momentum.py nomomentum # J2 对照：等权全池+风控不选股 vs 动量轮动，量化选股边际
-  python etf_momentum.py bondstress # J4 防守资产债牛敏感性：国债收益替换 0%/−2% 重算回撤与 Calmar
-  python etf_momentum.py freezetest # J5 样本外冻结期检验：近期段选股边际+风控稳健性,PBO=0.67 再审视
-  python etf_momentum.py turnover   # 换手率归因:hold_all vs 选股年换手对比 + 换手来自候选/vol/趋势哪类
+  python engine.py            # 真实数据：改进版 vs 无风控版 vs 基准 + 出图
+  python engine.py sweep      # 参数稳健性扫描（不同回看窗口/持仓数）
+  python engine.py robust     # 单参数扰动稳健性（看是不是"平台"，查过拟合）
+  python engine.py wf         # walk-forward 滚动样本外（量化样本外夏普衰减）
+  python engine.py boot       # RISK_ADJ 夏普提升的 bootstrap 显著性检验
+  python engine.py bootmom    # A2 混合动量加权 的 A/B + bootstrap 显著性检验
+  python engine.py dsr        # G1 Deflated Sharpe：多重比较下的夏普可信度
+  python engine.py universe   # 标的池消融：踢掉黄金/纳指，量化 alpha 对池子的依赖
+  python engine.py nomomentum # J2 对照：等权全池+风控不选股 vs 动量轮动，量化选股边际
+  python engine.py bondstress # J4 防守资产债牛敏感性：国债收益替换 0%/−2% 重算回撤与 Calmar
+  python engine.py freezetest # J5 样本外冻结期检验：近期段选股边际+风控稳健性,PBO=0.67 再审视
+  python engine.py turnover   # 换手率归因:hold_all vs 选股年换手对比 + 换手来自候选/vol/趋势哪类
 """
 import sys
 import math
@@ -27,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from momentum_core import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
+from cta import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
                            VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, TREND_CODE, SKIP_RECENT,
                            RISK_ADJ, LOOKBACK_WEIGHTS, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
@@ -698,7 +698,7 @@ def run_robust(px):
 # 训练段选参用的候选网格（控制在 8 个，覆盖关键维度，避免组合爆炸）。
 # 每条都显式带 trend_ma=TREND_MA —— 与 main 部署版同口径；否则 backtest 默认 trend_ma=None，
 # WF 评估的就成了“无趋势过滤”策略族，样本外衰减率无法挂到实际部署的策略上。
-# 基线用 risk_adj=False，与 momentum_core.RISK_ADJ 当前默认一致。
+# 基线用 risk_adj=False，与 cta.RISK_ADJ 当前默认一致。
 WF_GRID = [
     dict(lookbacks=(21, 63, 126), top_n=3, trend_cut=0.5, risk_adj=False, trend_ma=TREND_MA),  # 部署默认
     dict(lookbacks=(21, 63, 126), top_n=3, trend_cut=0.5, risk_adj=True,  trend_ma=TREND_MA),  # 开风险调整对照
@@ -1145,9 +1145,9 @@ def run_dsr(px):
 
 # ---------------- universe：标的池消融（alpha 对池子构成的依赖）----------------
 def _with_pool(sub_dict, fn):
-    """临时把 momentum_core.POOL 和本模块 POOL 都换成 sub_dict、跑完 fn() 恢复。
+    """临时把 cta.POOL 和本模块 POOL 都换成 sub_dict、跑完 fn() 恢复。
     backtest 与 decide_targets 内部都按各自模块的全局 POOL 遍历标的，故两处都要换。"""
-    import momentum_core as mc
+    import cta as mc
     g = globals()
     saved = (g["POOL"], mc.POOL)
     g["POOL"] = sub_dict
@@ -1348,7 +1348,7 @@ def run_turnover(px):
     |fin_t − fin_{t−1}| 代数上 = Δeq + Δvol_offset + Δtrend_offset,各取绝对值即各机制的毛调整
     贡献(各机制可部分抵消,占比之和可>100%;真实成交换手见上方年换手率)。为取中间状态,这里
     手动复现 decide_targets 的 hold_all 三阶段(decide_targets 只返回最终 target);若其改动需同步。"""
-    from momentum_core import blended_momentum, _realized_vol, _below_trend, CASH_BUFFER
+    from cta import blended_momentum, _realized_vol, _below_trend, CASH_BUFFER
     need = max(MAX_LOOKBACK, max(LOOKBACKS))
     years = (px.index[-1] - px.index[need]).days / 365.25
     dcode = DEFENSE[0]

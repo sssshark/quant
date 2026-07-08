@@ -29,9 +29,9 @@ A股实操约束:ETF 融券几乎不可行 → 不能做空一头 → 经典市�
 import numpy as np
 import pandas as pd
 
-import momentum_core as mc
-import etf_momentum as e
-from etf_momentum import DEFENSE, BENCH, COMMISSION, SLIPPAGE
+import cta as mc
+import engine as e
+from engine import DEFENSE, BENCH, COMMISSION, SLIPPAGE
 
 W = 20                       # 布林带 / z-score 回看窗口(经典月度)
 GATE_MA = mc.TREND_MA        # regime gate 用的大盘均线(与 CTA trend filter 同源,公平)

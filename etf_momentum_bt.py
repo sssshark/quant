@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-A股 ETF 动量轮动回测 —— Backtrader 版（对照向量化版 etf_momentum.py，做更贴近实盘的撮合）。
+A股 ETF 动量轮动回测 —— Backtrader 版（对照向量化版 engine.py，做更贴近实盘的撮合）。
 
-选股逻辑与 etf_momentum.py、实盘共用同一个 momentum_core.decide_targets；这里负责更真实
+选股逻辑与 engine.py、实盘共用同一个 cta.decide_targets；这里负责更真实
 的成交：每月第一个交易日按当日收盘价（cheat-on-close）调仓，broker 自动算量、扣手续费/滑点。
 
 为什么也保留这个框架版：
@@ -17,7 +17,7 @@ import pandas as pd
 import backtrader as bt
 
 # 策略参数与“选股大脑”统一从核心模块导入，回测/实盘共用一份逻辑
-from momentum_core import (POOL, DEFENSE, MAX_LOOKBACK,
+from cta import (POOL, DEFENSE, MAX_LOOKBACK,
                            COMMISSION, SLIPPAGE, BENCH, TREND_MA, _limit, decide_targets)
 
 START_CASH = 1_000_000
@@ -28,7 +28,7 @@ HISTORY = max(MAX_LOOKBACK, TREND_MA)
 # ---------------- 数据获取（返回 OHLCV，按各自上市日） ----------------
 def load_real():
     """用 akshare 拉真实日线（前复权 OHLCV），每只 ETF 用自身上市后的区间。
-    改进项 E2：带重试 + 指数退避，应对东财接口限频（详见 etf_momentum.load_real 注释）。"""
+    改进项 E2：带重试 + 指数退避，应对东财接口限频（详见 engine.load_real 注释）。"""
     import akshare as ak
     import time
     codes = list(POOL.keys()) + [DEFENSE[0]]   # 池中所有股票 ETF + 防守资产
@@ -62,7 +62,7 @@ def load_real():
 # ---------------- 策略 ----------------
 class MomentumRotation(bt.Strategy):
     # rebal_days：预计算好的"每月最后一个交易日"集合（date 对象）。只在这些日子调仓，
-    # 与向量化版 etf_momentum.py 的月末调仓口径对齐。传 None 则退回"每月第一个交易日"。
+    # 与向量化版 engine.py 的月末调仓口径对齐。传 None 则退回"每月第一个交易日"。
     params = (("rebal_days", None),)
 
     def __init__(self):

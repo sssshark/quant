@@ -2,7 +2,7 @@
 """
 动量轮动策略「核心大脑」—— 纯 Python，不依赖 backtrader / xtquant。
 
-回测（etf_momentum.py / etf_momentum_bt.py）和实盘（etf_momentum_live.py）都调用
+回测（engine.py / etf_momentum_bt.py）和实盘（etf_momentum_live.py）都调用
 这里的 decide_targets()，保证“回测怎么选、实盘就怎么选”，逻辑只有一份。
 
 策略要点（相对最初的单一 60 日动量做了三处改进）：
@@ -42,7 +42,7 @@ RISK_ADJ = False                       # 风险调整动量：动量÷该标的�
 #   序列 → 与 LOOKBACKS 对齐的非负权重，加权平均 mom = Σ(wᵢ·vᵢ)/Σwᵢ（函数内归一，传入不必归一）。
 #          例 (1,2,3) 让 126 日权重是 21 日的 3 倍；(21,63,126) 即"权重∝窗口长度"——长窗口最高、
 #          无额外可调参数，是最可辩护的"长窗口更高权"方案。
-# 是否启用看配对 block bootstrap 显著性（etf_momentum.bootstrap_mom_weights）；不显著则保持默认
+# 是否启用看配对 block bootstrap 显著性（engine.bootstrap_mom_weights）；不显著则保持默认
 # None（省一个过拟合自由度，与 RISK_ADJ 同理）。
 LOOKBACK_WEIGHTS = None
 MAX_LOOKBACK = max(LOOKBACKS)          # 需要的最少历史长度（注意：跳过期 skip 会额外吃历史，见 blended_momentum）

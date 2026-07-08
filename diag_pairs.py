@@ -22,9 +22,9 @@ import numpy as np
 import pandas as pd
 from itertools import combinations
 
-import momentum_core as mc
-import etf_momentum as e
-from etf_momentum import POOL, BENCH, COMMISSION, SLIPPAGE
+import cta as mc
+import engine as e
+from engine import POOL, BENCH, COMMISSION, SLIPPAGE
 
 WINDOW = 60        # 价差 z-score 回看窗口
 ENTRY = 2.0        # z 超过 ±2 开仓

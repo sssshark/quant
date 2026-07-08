@@ -17,8 +17,8 @@ risk-parity:权重 ∝ 1/σ_i(波动反比),让每个策略对组合总风险的
 import numpy as np
 import pandas as pd
 
-import momentum_core as mc
-import etf_momentum as e
+import cta as mc
+import engine as e
 from multi_strategy import CTAStrategy, BondMomentumStrategy
 
 N_BOOT = 2000

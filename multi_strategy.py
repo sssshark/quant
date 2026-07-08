@@ -14,7 +14,7 @@
 import numpy as np
 from typing import Protocol
 
-from momentum_core import decide_targets, POOL, DEFENSE
+from cta import decide_targets, POOL, DEFENSE
 
 
 class Strategy(Protocol):
