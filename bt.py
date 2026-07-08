@@ -10,7 +10,7 @@ A股 ETF 动量轮动回测 —— Backtrader 版（对照向量化版 engine.py
   - 调仓按当日价成交、先卖后买，更贴近真实账户；向量化版则适合快速调参研究。
 
 运行：
-  python etf_momentum_bt.py            # 真实数据（需 akshare）
+  python bt.py            # 真实数据（需 akshare）
 """
 import numpy as np
 import pandas as pd

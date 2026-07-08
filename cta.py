@@ -2,7 +2,7 @@
 """
 动量轮动策略「核心大脑」—— 纯 Python，不依赖 backtrader / xtquant。
 
-回测（engine.py / etf_momentum_bt.py）和实盘（etf_momentum_live.py）都调用
+回测（engine.py / bt.py）和实盘（live.py）都调用
 这里的 decide_targets()，保证“回测怎么选、实盘就怎么选”，逻辑只有一份。
 
 策略要点（相对最初的单一 60 日动量做了三处改进）：
@@ -54,7 +54,7 @@ CASH_BUFFER = 0.99                     # 目标仓位上限（留 1% 现金，�
 # True = 等权全池+风控:跳过选股与绝对动量,等权持有全部有足够历史的候选标的,风控
 #       (vol_target/趋势/崩溃/回撤)原样运行。J1(美股 23 年)+ J2(A 股)两市一致结论:
 #       动量选股无可靠 alpha(bootstrap P=0.148 / 0.560)、选股还略抬高回撤;等权全池版
-#       夏普≈选股版、回撤更浅、少一层过拟合风险。重稳健可切 True。实盘由 etf_momentum_live
+#       夏普≈选股版、回撤更浅、少一层过拟合风险。重稳健可切 True。实盘由 live
 #       读 live_config.json 的 "hold_all" 覆盖此默认(见 _load_hold_all)。
 HOLD_ALL = False
 VOL_TARGET = 0.15                      # 年化目标波动；组合近期波动超此值就降风险仓（None=关闭）

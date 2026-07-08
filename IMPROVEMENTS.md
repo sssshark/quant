@@ -5,7 +5,7 @@
 > Moreira-Muir(波动管理)、Daniel-Moskowitz(动量崩溃)、
 > 桥水(风险平价)、AHL/Winton(CTA)、López de Prado(回测过拟合检验)。
 >
-> **共 79 条**:[高] 16(定位内应补)/ [中] 37(可选)/ [低] 22(超出当前定位)。含 2026-07-06 **J 节评审**新开 7 条(2高+3中+2低)——"跟主流策略比"的方法论盲区,多数 CUT ACROSS 已有条目(是对"已有结论被轻放"的再审视);含 2026-07-07 **F8** 多因子归因(扩 F4 CAPM,剥离被误判为 alpha 的债/金 beta);2026-07-08 新开 **M 节**多策略组合框架(B 型,4 条:M1 接口 + M3 国债时序动量 + M4 risk-parity + M2 模块改名 均落地 + M5/M6/M7/M8 板块选股诊断(负结果,M7修正M6过强,M8供需证伪方法论闭环))
+> **共 79 条**:[高] 16(定位内应补)/ [中] 37(可选)/ [低] 22(超出当前定位)。含 2026-07-06 **J 节评审**新开 7 条(2高+3中+2低)——"跟主流策略比"的方法论盲区,多数 CUT ACROSS 已有条目(是对"已有结论被轻放"的再审视);含 2026-07-07 **F8** 多因子归因(扩 F4 CAPM,剥离被误判为 alpha 的债/金 beta);2026-07-08 新开 **M 节**多策略组合框架(B 型,4 条:M1 接口 + M3 国债时序动量 + M4 risk-parity + M2 模块改名 均落地 + M5/M6/M7/M8 板块选股诊断(负结果,M7修正M6过强,M8供需证伪方法论闭环) + M9 入口改名(bt/live))
 
 ## 用法
 
@@ -22,7 +22,7 @@
 ## 进度
 
 ```
-总 83  ┃ 已完成 60 ┃ 待办 23        [高]0 [中]0 [低]23（J1–J5 全结案 + F8 多因子归因 + M1/M2/M3/M4 多策略全落地 + M5/M6/M7/M8 板块选股诊断(负结果,M7修正M6过强,M8供需证伪):[高]/[中] 清零,剩 [低] 均超定位/待实盘/阶段2）。完成明细见各条目
+总 84  ┃ 已完成 61 ┃ 待办 23        [高]0 [中]0 [低]23（J1–J5 全结案 + F8 多因子归因 + M1/M2/M3/M4 多策略全落地 + M5/M6/M7/M8 板块选股诊断(负结果,M7修正M6过强,M8供需证伪) + M9 入口改名(bt/live):[高]/[中] 清零,剩 [低] 均超定位/待实盘/阶段2）。完成明细见各条目
 [高] 0（全清）  ┃ [中] 0（全清）  ┃ [低] 23
 ```
 （每完成一批,更新上面三组数字)
@@ -305,6 +305,14 @@
   选股结论不受影响)。**A 股内部卫星六连挂**(均值回归/配对/板块动量/板块非动量/全行业综合/供需),
   分散只能来自资产类别(国债已用)或跨市场。
 
+- [x] **M9** 入口文件改名(2026-07-09,代码整洁)— M2 把核心引擎 etf_momentum.py→engine.py
+  时刻意保留了 etf_momentum_bt.py(Backtrader 撮合回测,对照向量化 engine)/ etf_momentum_live.py
+  (miniQMT 实盘骨架),核心改名后这两个 etf_momentum 前缀名不副实。本次 `git mv` 改
+  etf_momentum_bt.py→**bt.py**、etf_momentum_live.py→**live.py**(与 engine/cta/multi_strategy/
+  paper_broker 简洁风格一致)。引用更新:test_momentum `import live as L` + cta/paper_broker/
+  live_config.example/bt/live 自身共 9 处(etf_momentum_bt→bt、etf_momentum_live→live,不影响
+  live_config)。历史 changelog(H1/H2/J2/M2)旧名保留(历史记录)。
+
 ## 解决记录 (Changelog)
 
 > 每完成一条,在此追加一行。建议:`日期 | 编号 | 改动摘要 | 验证方式 | 结果`
@@ -352,6 +360,7 @@
 | 2026-07-06 | J5 | `run_freezetest`/`freezetest` 子命令:连续跑策略在 2022-01-01 切开,按段(全样本/调参期/冻结期)切指标,比选股 vs 等权+风控 vs B&H | `engine.py freezetest` 实跑(tushare)+ py_compile | **PBO=0.67 警告被证实**:冻结期(2022–26)选股输给等权+风控(夏普 0.74<0.79、回撤 −15.0%<−10.8%)——全样本调出的选股近期段不成立,'经验默认'没消除选择偏差。但风控层冻结期仍跑赢 B&H +0.55 夏普、回撤砍到 1/3 → 过拟合集中在选股层、风控层稳健。DSR@100 担忧已由 J3 化解(月频 0.999)。**J5 结案,进度 [中]1→0([高]/[中] 全清)** |
 | 2026-07-07 | F8 | `factor_attribution_multi(daily, px)` 多因子 OLS(MKT/SMB/VMG/BND/GLD/NSDQ 6 因子,从 `px` 构造、含截距 lstsq + t-stat + 调整 R² + 相关矩阵)+ `_factor_returns`/`_MFACTORS` + `run_mfattribution`/`mfat` 子命令(与 attrib 同源全风控) | `test_factor_attribution_multi_recovery` + `test_mfat_strips_spurious_alpha`(核心论点:真α=0+债金beta→CAPM假阳性、多因子剥回近0)+ test 12/12 + `engine.py mfat` 实跑(tushare n=3100) | **CAPM α+11.7%→多因子 α+7.0%,剥离+4.7%**(CAPM 误归为 alpha 的债/金/纳指/小盘 beta)。MKT β0.55/BND β0.22(t3.2)/GLD β0.13/NSDQ β0.13,R²0.41→0.53。**判读**:CAPM 高估 ~40%,但 +7.0% 真 alpha 存活(风控/择时在静态资产暴露外的附加值,印证 F3 非纯beta);caveat:6因子只剥资产类别 beta,未含动量/低波风格因子(策略本身属性),7.0% 是诚实下界非纯skill点估计。**F8 结案**,进度 总74→75/已完51→52 |
 | 2026-07-08 | M8 | `diag_sector_supply.py`(供需择时回测三道关)+`diag_fut_term_probe.py`(期限结构算法+sanity);`diag_sector_comprehensive.py`候选标签修正(515210钢铁/516710新材料);数据探查(行业PE/PB覆盖/期货fut_daily结构,临时脚本已删) | 3品种(铜CU/螺纹RB/豆粕M)期限结构sanity+回测(tushare n=1334) | **供需证伪**:sanity相关+0.038/-0.054/-0.001(≈0/负)、多头端不系统占优;回测夏普**-0.48**/年化-6.5%/vs基本盘+0.471,三关全挂、比等权B&H(0.02)还差。**最前瞻供需信号(期限结构)对A股商品股无alpha**(商品股不跟期货)。方法论闭环:价值(行业PE/PB免费版不覆盖)/供需(证伪)/政策(无干净数据+定性难回测)三路全封,板块过不了互补关(权益同源)。**M8结案**,进度 总82→83/已完59→60 |
+| 2026-07-09 | M9 | `git mv etf_momentum_bt.py bt.py`+`etf_momentum_live.py live.py`;引用替换9处(test_momentum `import live as L` + cta/paper_broker/live_config.example/bt-live 注释) | grep确认 .py/.json 无残留 etf_momentum_bt/live + test_momentum 21/21 + import 冒烟(bt/live/cta)+ py_compile | **入口改名**:核心引擎已 engine.py,两个 etf_momentum 前缀入口(Backtrader 回测/miniQMT 实盘)改名 bt/live 对齐简洁风格;历史 changelog 旧名保留。**M9结案**,进度 总83→84/已完60→61 |
 | 2026-07-08 | M1 | 新 `multi_strategy.py`(`Strategy` 协议 + `CTAStrategy` 瘦策略默认 `hold_all=True` + 等权 `MultiStrategy`)+ `backtest(strategy=)` 决策来源可插拔 + `run_multi`/`multi` 子命令 | `test_multi_k1_equivariance`(K=1 + K=2 守恒)+ test 17/17 + `engine.py multi` 实跑(tushare 12.7年) | 真实数据 NAV 差异 **0.00e+00**(策略路径逐点复刻 `decide_targets` 直连);CTA 因子化为独立 Strategy,阶段2 加第二个策略即进入组合层(资金分配/相关性/组合 PBO) |
 | 2026-07-08 | M3 | `BondMomentumStrategy`(国债混合动量+MA200趋势;⚠ 空仓返回 `{bond:0.0}` 而非 `{}`,否则 backtest `if target` 当无操作→退化买入持有,夏普1.37→1.51)+ `run_multi` 扩 K=2 + 国债占比 allocs 扫描 | `test_bond_strategy_equivariance`(atol1e-9)+ `test_multi_k2_diversification` + test 19/19 + `multi` 实跑 | 三候选诊断唯一通过三道关:国债 vs CTA 相关性 **-0.115**(股债跷跷板)、自身夏普**1.51**/回撤-4.4%、**K=2 等权组合夏普1.29 > 单CTA1.01 + 回撤-16.9%→-7.5%砍半**;allocs 国债75%夏普峰值1.69(诊断用,部署等权);trade-off:组合年化11.4%→7.4%(用收益换稳健) |
 | 2026-07-08 | M4 | `RiskParityMulti`(滚动σ权重∝1/σ,末尾对齐估子策略波动)+ `run_multi` 展示 + `diag_riskparity`(静态/滚动/backtest 三口径) | `test_riskparity_k1_equivariance`(K=1守恒)+`test_riskparity_k2_diversification` + 21/21 + diag 实跑 | **双口径**:日频诊断夏普1.91 vs等权1.29 P=**0.001显著**;月频落地1.45 vs1.29 P=**0.186不显著**(CI跨0)。**结论**:risk-parity概念对但价值依赖再平衡频率,月频调仓滞后吃掉优势→**保持等权默认**,`RiskParityMulti`留可选(回撤/Sortino略优);洞察:risk-parity需高频再平衡才显现 |

@@ -6,7 +6,7 @@
       更新持仓→跨月保存）先在本地跑通。成交规则与回测一致（手续费+滑点）。
 状态持久化到 JSON，所以每月运行一次、持仓会累积，行为贴近真实账户。
 
-接入真实 miniQMT 时无需改这里：把 etf_momentum_live.py 的 BROKER 改成 "qmt" 即可。
+接入真实 miniQMT 时无需改这里：把 live.py 的 BROKER 改成 "qmt" 即可。
 """
 import json     # 把账户状态存成 JSON 文本文件
 import os        # 判断状态文件是否已存在（os.path.exists）

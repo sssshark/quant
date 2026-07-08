@@ -1,5 +1,5 @@
 {
-  "_comment": "实盘凭证 + 策略开关样例——把本文件复制为 live_config.json（已 gitignore，不入仓库），填入你的真实值。凭证也可改用环境变量 QMT_PATH / QMT_ACCOUNT_ID（优先级高于本文件）。两者都没配时，etf_momentum_live 回退占位值并拒绝连真实账户（只走 paper/演示）。",
+  "_comment": "实盘凭证 + 策略开关样例——把本文件复制为 live_config.json（已 gitignore，不入仓库），填入你的真实值。凭证也可改用环境变量 QMT_PATH / QMT_ACCOUNT_ID（优先级高于本文件）。两者都没配时，live 回退占位值并拒绝连真实账户（只走 paper/演示）。",
   "qmt_path": "C:\\华泰证券QMT\\userdata_mini",
   "account_id": "你的资金账号",
   "_hold_all_comment": "⚠ 实盘建议 true。true=等权全池+风控(不选股,J1/J2/J5/G3 验证的稳健版:两市均显示动量选股无可靠 alpha、美股更显著为负 P=0.999、PBO=0.67 过拟合、冻结期选股输给等权);false/省略=动量轮动选股(默认,仅作策略展示,实盘不建议)。改这个键即可切换,无需改代码。",

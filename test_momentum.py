@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import cta as mc
 import engine as e
-import etf_momentum_live as L
+import live as L
 
 
 def test_norm_roundtrip():

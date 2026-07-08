@@ -4,7 +4,7 @@
 
 它做的事：
   1. 取最近 N 日收盘价；
-  2. 调用 decide_targets()（和 etf_momentum_bt.py 完全同一套选股逻辑）得到目标权重；
+  2. 调用 decide_targets()（和 bt.py 完全同一套选股逻辑）得到目标权重；
   3. 连接 miniQMT，读取账户总资产 + 当前持仓；
   4. 算出目标股数，生成「先卖后买」的调仓订单；
   5. DRY_RUN=True 时只打印计划、不下单；接通并核对无误后再改 False 真正下单。
@@ -19,7 +19,7 @@
   - 程序化交易需按交易所要求报备。
 
 运行：
-  python etf_momentum_live.py          # 默认 DRY_RUN，只打印调仓计划
+  python live.py          # 默认 DRY_RUN，只打印调仓计划
 """
 import os
 import sys
@@ -312,7 +312,7 @@ def is_month_end_trading_day():
 
 
 def main():
-    force = "force" in sys.argv[1:]               # python etf_momentum_live.py force 可强制重跑
+    force = "force" in sys.argv[1:]               # python live.py force 可强制重跑
     if MONTH_END_ONLY and not is_month_end_trading_day() and not force:
         print(f"[{BROKER}] 今天不是本月最后一个交易日，按月末调仓口径跳过。加 force 可强制运行。")
         return
