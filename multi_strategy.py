@@ -54,6 +54,47 @@ class CTAStrategy:
         return tg
 
 
+class BondMomentumStrategy:
+    """国债时序动量瘦策略:单一 alpha 源 = 国债趋势(做多处于上涨趋势的国债)。
+
+    diag_bonds 实测(2026-07-08):夏普 1.5、回撤 -4.4%,与 CTA 相关性 -0.06~-0.11
+    (股债跷跷板,熊市 -0.10~-0.15),50/50 组合夏普 1.29 > 单 CTA 1.01 —— 是三候选
+    (均值回归 / 配对 / 国债)里唯一通过"互补 + 自身 + 组合增益"三道关的第二策略。
+
+    target 逻辑(对齐 diag_bonds.bond_momentum;月末调仓由 backtest 的 rebal_days 决定、T+1 成交):
+      截至 t 的国债混合动量(21/63/126 日涨幅均值)>0 且(若开趋势)价>MA200 → 满仓国债;
+      否则空仓(返回 {bond:0.0},显式 0 触发清仓;⚠ 空 dict {} 会被 backtest 当无操作、维持旧仓)。
+      空仓即降低久期敞口、持现金——单标的时序策略的标准避险形态,
+      与 CTA"挪到防守资产"不同(国债策略本身就在债里,避险 = 降仓,不切换资产)。
+
+    universe=[bond]:只可能输出国债一个 code。backtest 据此只喂国债价格(轻量)。
+    """
+    def __init__(self, name="国债时序动量", bond=DEFENSE[0], with_trend=True,
+                 lookbacks=(21, 63, 126)):
+        self.name = name
+        self.bond = bond
+        self.with_trend = with_trend
+        self.lookbacks = tuple(lookbacks)
+        self.universe = [bond]
+
+    def target(self, recent, t):
+        p = recent.get(self.bond, [])
+        # 历史下限:动量需 max(lookbacks)+1 个点;趋势过滤需 200 日 MA
+        need = 201 if self.with_trend else (max(self.lookbacks) + 1)
+        # ⚠ 空仓一律返回 {bond:0.0}(非空 dict),绝不能返回 {} —— backtest 的 `if target:`
+        # 把空 dict 当"无操作"(不设 pending、不调仓),返回 {} 会维持旧仓、清不掉,策略退化成
+        # 买入持有。显式 0.0 经 _apply_target_with_limits 正确清仓到现金。
+        if len(p) < need:
+            return {self.bond: 0.0}
+        last = p[-1]
+        mom = sum(last / p[-1 - lb] - 1 for lb in self.lookbacks) / len(self.lookbacks)
+        if mom <= 0:
+            return {self.bond: 0.0}
+        if self.with_trend and last <= sum(p[-200:]) / 200.0:
+            return {self.bond: 0.0}
+        return {self.bond: 1.0}
+
+
 class MultiStrategy:
     """等权组合器(阶段1)。allocs=None → 每策略 1/K;传入则归一化到和为 1。
 

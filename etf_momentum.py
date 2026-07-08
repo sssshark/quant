@@ -1469,6 +1469,44 @@ def run_multi(px, lim=None):
     else:
         print(f"  ✓ 守恒通过:阶段1 接口闭环。后续在此叠加第二个策略即进入阶段2(组合层)。")
 
+    # ===== 阶段2 第一枪:K=2 组合(CTA + 国债时序动量)=====
+    # 国债时序动量是三候选里唯一通过"互补+自身+组合增益"三道关的第二策略(diag_bonds 实测:
+    # 夏普 1.5、与 CTA 相关性 -0.06~-0.11 股债跷跷板、50/50 组合夏普 1.29 > 单 CTA 1.01)。
+    from multi_strategy import BondMomentumStrategy
+    print()
+    print("=" * 64)
+    print("[阶段2 第一枪] K=2 组合:CTA(等权+风控) + 国债时序动量")
+    print("=" * 64)
+    # CTA 用 hold_all=True(CTAStrategy 默认 / diag_bonds 口径),与国债诊断对齐;
+    # 注意与上方 K=1 的 hold_all=False 不同——K=1 对齐 real,K=2 对齐 diag_bonds。
+    cfg_cta = dict(vol_target=VOL_TARGET, trend_ma=TREND_MA, hold_all=True)
+    cta = CTAStrategy(**cfg_cta)
+    bond = BondMomentumStrategy()
+    nav_cta2, ret_cta2, _, _ = backtest(px, strategy=cta, **lim)
+    nav_b, ret_b, _, _ = backtest(px, strategy=bond, **lim)
+    multi2 = MultiStrategy([cta, bond], allocs=[0.5, 0.5])
+    nav2, ret2, _, _ = backtest(px, strategy=multi2, **lim)
+    print("  --- 单策略与等权组合 ---")
+    _print_table([
+        ("CTA(等权+风控, hold_all=True)", perf(nav_cta2, ret_cta2)),
+        ("国债时序动量", perf(nav_b, ret_b)),
+        ("K=2 等权组合(50/50)", perf(nav2, ret2)),
+    ])
+    common = ret_cta2.index.intersection(ret_b.index)
+    carr = ret_cta2.loc[common].to_numpy(dtype=float)
+    barr = ret_b.loc[common].to_numpy(dtype=float)
+    corr = float(np.corrcoef(carr, barr)[0, 1])
+    print(f"  CTA vs 国债 收益相关性: {corr:+.3f}  (负/低 = 股债跷跷板 = 分散来源)")
+    # 国债占比扫描:看有效前沿(⚠ 诊断用,含选样过拟合;部署默认等权 50/50,不部署扫描最优)
+    print("  --- 国债占比扫描(⚠ 诊断用;部署默认等权 50/50)---")
+    print(f"  {'国债占比':>8}{'年化':>9}{'夏普':>7}{'回撤':>8}")
+    for w in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        m = MultiStrategy([cta, bond], allocs=[1 - w, w])
+        nw, rw, _, _ = backtest(px, strategy=m, **lim)
+        pw = perf(nw, rw)
+        tag = "  ← 等权(部署默认)" if abs(w - 0.5) < 1e-9 else ""
+        print(f"  {w*100:>7.0f}%{pw['年化']*100:>8.1f}%{pw['夏普']:>7.2f}{pw['回撤']*100:>7.1f}%{tag}")
+
 
 def run_review():
     """D1/D2 改完后，在新口径（T+1 成交 + 涨跌停）下复核 C1/C2 的旧结论是否仍成立。

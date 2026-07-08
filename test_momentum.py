@@ -270,6 +270,61 @@ def test_multi_k1_equivariance():
     assert np.allclose(nav1.values, nav2.values, atol=1e-9)        # K=2 合并 == 单 CTA
 
 
+def test_bond_strategy_equivariance():
+    """阶段2:BondMomentumStrategy 经 backtest(strategy=) 的 NAV == 内联向量化(同口径)。
+    合成国债价格(含上涨/回调段让信号切换),无涨跌停 → 逐点一致。
+    口径要点:backtest 是「T 日信号、T+1 落地、新仓 T+2 起吃收益」(weights.shift(1)),
+    故内联 weights=sig_ffill.shift(1)、gross=weights.shift(1)*ret,精确复现(非 diag_bonds 的 T+1)。"""
+    from multi_strategy import BondMomentumStrategy
+    rng = np.random.default_rng(7)
+    bond = mc.DEFENSE[0]
+    idx = pd.date_range("2018-01-01", periods=600, freq="B")
+    drift = np.concatenate([np.full(300, 0.0002), np.full(150, -0.0004), np.full(150, 0.0002)])
+    px = pd.DataFrame({bond: 100 * np.cumprod(1 + drift + rng.normal(0, 0.002, len(idx)))}, index=idx)
+    nav_s, _, _, _ = e.backtest(px, strategy=BondMomentumStrategy())   # 策略路径
+    # 内联向量化(精确对齐 backtest:月末采样、T+1 落地、T+2 吃收益、扣换手成本)
+    p = px[bond]
+    month_ends = px.resample("ME").last().index
+    rebal = [px.index[px.index <= me][-1] for me in month_ends if (px.index <= me).any()]
+    rebal = [d for d in rebal if d >= px.index[mc.MAX_LOOKBACK]]
+    rd_set = set(rebal)
+    mom = (p / p.shift(21) - 1 + p / p.shift(63) - 1 + p / p.shift(126) - 1) / 3
+    sig = ((mom > 0) & (p > p.rolling(200).mean())).astype(float)
+    weights_v = sig.where(sig.index.isin(rd_set)).ffill().shift(1).fillna(0.0)   # = backtest weights
+    w_lag = weights_v.shift(1).fillna(0.0)
+    ret = p.pct_change().fillna(0.0)
+    gross = w_lag * ret
+    turnover = (weights_v - weights_v.shift(1).fillna(0.0)).abs()
+    net = (gross - turnover * (e.COMMISSION + e.SLIPPAGE)).fillna(0.0)
+    nav_v = (1 + net).cumprod().loc[px.index[mc.MAX_LOOKBACK]:]
+    nav_v = nav_v / nav_v.iloc[0]
+    assert np.allclose(nav_s.values, nav_v.values, atol=1e-9), \
+        f"Bond 策略路径与向量化不一致,max diff={abs(nav_s.values - nav_v.values).max():.2e}"
+
+
+def test_multi_k2_diversification():
+    """阶段2:K=2 组合(CTA + 国债时序动量)跑通,且分散有效——组合年化波动 < 单 CTA
+    (不同 beta 叠加降低总风险)。合成价格(POOL + 低波国债,足够长含月末调仓)。"""
+    from multi_strategy import CTAStrategy, BondMomentumStrategy, MultiStrategy
+    rng = np.random.default_rng(11)
+    cols = list(mc.POOL) + [mc.DEFENSE[0]]
+    idx = pd.date_range("2016-01-01", periods=700, freq="B")
+    data = {}
+    for c in cols:
+        if c == mc.DEFENSE[0]:
+            data[c] = 100 * np.cumprod(1 + rng.normal(0.0001, 0.003, len(idx)))     # 国债低波
+        else:
+            data[c] = 100 * np.cumprod(1 + rng.normal(0.0002, 0.012, len(idx)))     # 权益高波
+    px = pd.DataFrame(data, index=idx)
+    cfg = dict(vol_target=mc.VOL_TARGET, trend_ma=mc.TREND_MA, hold_all=True)
+    cta, bond = CTAStrategy(**cfg), BondMomentumStrategy()
+    _, ret_c, _, _ = e.backtest(px, strategy=cta)
+    _, ret_k2, _, _ = e.backtest(px, strategy=MultiStrategy([cta, bond], allocs=[0.5, 0.5]))
+    vol_c = ret_c.std() * np.sqrt(252)
+    vol_k2 = ret_k2.std() * np.sqrt(252)
+    assert vol_k2 < vol_c, f"K=2 波动 {vol_k2:.4f} 未低于单 CTA {vol_c:.4f},分散失效"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":
