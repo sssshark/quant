@@ -442,6 +442,52 @@ def test_load_hold_all_strict_bool():
             os.remove(cfg)
 
 
+def test_eastmoney_qfq_series_success():
+    """E6+ 东财 helper: fund_etf_hist_em 返回 DataFrame → 解析为以 code 命名的 float Series。"""
+    from unittest.mock import patch
+    fake = pd.DataFrame({"日期": ["2024-01-02", "2024-01-03"], "收盘": [1.0, 1.01]})
+    with patch("akshare.fund_etf_hist_em", return_value=fake):
+        s = e._eastmoney_qfq_series("510300")
+    assert s is not None, "成功应返回 Series 而非 None"
+    assert s.name == "510300"
+    assert list(s.values) == [1.0, 1.01]
+    assert str(s.dtype).startswith("float")
+
+
+def test_eastmoney_qfq_series_retries_then_none():
+    """E6+ 东财 helper: akshare 持续抛异常 → 4 次重试后返回 None（不抛、不崩,供兜底判定）。"""
+    from unittest.mock import patch
+    calls = {"n": 0}
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise RuntimeError("东财限频")
+    with patch("akshare.fund_etf_hist_em", side_effect=boom), patch("time.sleep"):
+        s = e._eastmoney_qfq_series("511010")
+    assert s is None, "4 次重试皆败应返回 None"
+    assert calls["n"] == 4, f"应重试 4 次,实际 {calls['n']}"
+
+
+def test_fill_critical_via_eastmoney():
+    """E6+ 关键标的兜底纯函数: series 缺 BENCH/DEFENSE[0] 时,_fill_critical_via_eastmoney
+    用东财补齐可补的(series/raw_d/pre_d 填充),东财也失败的标的留在 still_missing 供调用方降级。
+    这是 relay 抽风跳过锚定标的致 _anchor_start KeyError 崩盘的根治点。"""
+    from unittest.mock import patch
+    idx = pd.date_range("2024-01-01", periods=3, freq="B")
+    series = {"510500": pd.Series([1.0, 2.0, 3.0], index=idx, name="510500")}   # 缺 510300/511010
+    raw_d, pre_d = {}, {}
+    def fake_em(symbol, **k):
+        if symbol == "510300":
+            return pd.DataFrame({"日期": idx.strftime("%Y-%m-%d").tolist(),
+                                 "收盘": [10.0, 11.0, 12.0]})
+        raise RuntimeError("511010 东财限频")                # 511010 东财也失败 → 仍缺失
+    with patch("akshare.fund_etf_hist_em", side_effect=fake_em), patch("time.sleep"):
+        miss = e._fill_critical_via_eastmoney(series, raw_d, pre_d, ["510300", "511010"])
+    assert "510300" in series and "510300" in raw_d and "510300" in pre_d, "510300 应被东财补齐"
+    assert list(pre_d["510300"].dropna().values) == [10.0, 11.0], "pre_d=qfq.shift(1) → [10,11]"
+    assert "511010" not in series, "东财失败的标的不应进 series"
+    assert miss == ["511010"], f"511010 应留 still_missing,实际 {miss}"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

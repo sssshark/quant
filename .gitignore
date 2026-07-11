@@ -9,8 +9,8 @@ __pycache__/
 paper_account.json
 last_rebalance.txt
 
-# 回测产出的图（可由 etf_momentum.py 重新生成）
-ETF动量轮动_回测结果.png
+# 回测产出的图（可由 engine.py / bt_recent.py 重新生成；engine 全周期 + bt_recent 近 N 年窗口）
+ETF动量轮动_*.png
 
 # tushare 凭证（本地持有，不入仓库；_load_via_tushare 在环境变量缺失时回退读它）
 .tushare_token

@@ -148,6 +148,19 @@ def _load_via_tushare(with_limits=False):
     if not series:
         print("[E6 告警] tushare 所有标的拉取皆败,降级东财 akshare(换口径,仅兜底)")
         return None
+    # E6+ 关键标的兜底（2026-07-11）：BENCH(510300)/DEFENSE[0](511010) 是 _anchor_start 必需列，
+    # relay 间歇抽风跳过它们会让 px[[BENCH, DEFENSE[0]]] KeyError 崩盘（实盘调仓日 relay 抽风即此症）。
+    # 仅对缺失的关键标的走东财 qfq 补齐——非全量降级：口径切换限定在这 ≤2 个锚定/防守标的
+    # （均非动量选股标的，复权口径差异影响极小）。补完仍缺 → 返回 None 走全量东财兜底。
+    critical = [BENCH, DEFENSE[0]]
+    need_fill = [c for c in critical if c not in series]
+    if need_fill:
+        print(f"[E6 告警] 关键锚定标的 {need_fill} tushare fund_daily 失败,东财单独兜底"
+              f"（仅这 {len(need_fill)} 个换源,非全量降级）")
+        still_missing = _fill_critical_via_eastmoney(series, raw_d, pre_d, critical)
+        if still_missing:
+            print(f"[E6 告警] {still_missing} 东财兜底亦失败,降级全量东财 akshare（换口径）")
+            return None
     # E7 有界 ffill：只向前填 ≤3 交易日，更长 gap（停牌/未上市）留 NaN——避免无界 ffill 把
     # 停牌日填成平稳价、0% 收益喂给 _realized_vol（压低 vol→vol_target 不缩仓）与
     # blended_momentum（稀释趋势）。cta.blended_momentum/_asset_daily_vol 已 skip NaN，
@@ -164,32 +177,62 @@ def _load_via_tushare(with_limits=False):
     return px
 
 
+def _eastmoney_qfq_series(code):
+    """单标的东财 fund_etf_hist_em 前复权日线 Series（带 4 次重试 + 指数退避，应对东财 IP 限频）。
+    供 _load_via_eastmoney 复用（DRY），以及 _load_via_tushare 关键标的兜底（BENCH/DEFENSE
+    被 relay 抽风跳过时只补这几个、不触发全量降级换口径）。成功返回以 code 命名的 Series，
+    4 次重试皆败返回 None（由调用方决定 raise 还是降级）。"""
+    import akshare as ak, time
+    end = pd.Timestamp.today().strftime("%Y%m%d")
+    for attempt in range(4):
+        try:
+            df = ak.fund_etf_hist_em(symbol=code, period="daily",
+                                     start_date="20140101", end_date=end, adjust="qfq")
+            if len(df):
+                df["日期"] = pd.to_datetime(df["日期"])
+                return df.set_index("日期")["收盘"].astype(float).rename(code)
+        except Exception:
+            if attempt == 3:
+                return None
+        time.sleep(5 * (attempt + 1))
+    return None
+
+
+def _fill_critical_via_eastmoney(series, raw_d, pre_d, critical):
+    """关键标的（_anchor_start 必需列：BENCH/DEFENSE[0]）被 tushare relay 抽风跳过时，
+    用东财逐个补齐 series/raw_d/pre_d。纯函数（数据加载逻辑可单测，东财调用靠
+    _eastmoney_qfq_series 可 mock）。返回仍缺失的标的列表——空=全部补齐成功，调用方据此
+    决定是否降级全量东财。东财补的标的无独立 pre_close，raw/pre 用 qfq+shift 近似
+    （与 _load_via_eastmoney 的 limit_masks(px, px.shift(1)) 环比口径一致）。"""
+    still_missing = []
+    for c in critical:
+        if c in series:
+            continue
+        s = _eastmoney_qfq_series(c)
+        if s is None:
+            still_missing.append(c)
+            continue
+        series[c] = s
+        raw_d[c] = s
+        pre_d[c] = s.shift(1)
+    return still_missing
+
+
 def _load_via_eastmoney(with_limits=False):
     """东财 fund_etf_hist_em 前复权，带 4 次重试 + 指数退避（应对东财 IP 限频）。
 
     D2：with_limits=True 时用复权收盘环比近似涨跌停（akshare 回退路径，再拉一次 adjust=""
     会翻倍调用、东财本就限频不划算）。除权日复权因子会扭曲单日环比、可能误判封板，
     但 ETF 除权日极少、影响单日单标的，回测整体可忽略。主力走 tushare 即无此问题。"""
-    import akshare as ak, time
-    end_date = pd.Timestamp.today().strftime("%Y%m%d")
+    import time
     series = {}
     for c in ALL_CODES:
-        df = None
-        for attempt in range(4):
-            try:
-                df = ak.fund_etf_hist_em(symbol=c, period="daily",
-                                         start_date="20140101", end_date=end_date, adjust="qfq")
-                if len(df):
-                    break
-                df = None
-            except Exception as e:
-                if attempt == 3:
-                    raise RuntimeError(
-                        f"{c} 拉取失败（东财限频；建议配置 TUSHARE_TOKEN 走 tushare）: {e}") from e
-            time.sleep(5 * (attempt + 1))
-        time.sleep(0.3)
-        df["日期"] = pd.to_datetime(df["日期"])
-        series[c] = df.set_index("日期")["收盘"].astype(float).rename(c)
+        s = _eastmoney_qfq_series(c)
+        if s is None:
+            raise RuntimeError(
+                f"{c} 拉取失败（东财限频；建议配置 TUSHARE_TOKEN 走 tushare）")
+        series[c] = s
+        time.sleep(0.3)                                      # 东财 IP 限频，标的间留间隔
     px = pd.concat(series.values(), axis=1).sort_index()
     px = px.dropna(how="all").ffill(limit=3)               # E7 有界 ffill(同 tushare 路径,停牌>3日留 NaN)
     px = _anchor_start(px)
