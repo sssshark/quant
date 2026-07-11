@@ -194,8 +194,16 @@ def blended_momentum(arr, lookbacks=LOOKBACKS, skip=SKIP_RECENT, risk_adj=RISK_A
     return mom
 
 
-def _realized_vol(recent_closes, eq_codes, window):
-    """估计“持有股票等权组合”近 window 日的年化波动；数据不足返回 None。"""
+def _realized_vol(recent_closes, eq_codes, window, weights=None):
+    """估计"持有股票组合"近 window 日的年化波动；数据不足返回 None。
+
+    近似说明（修复项 C1 配套）：本函数对"等权组合"算日收益标准差×√252 年化。当 WEIGHTING=
+    'equal'（默认）时精确。当 WEIGHTING='inv_vol'（C1 反向波动加权，默认关）时,这里仍用
+    等权口径估组合波动——即 vol_target 标定在"等权 vol"上却作用在"inv_vol 权重"上,是一
+    处已知近似（inv_vol 默认关、风险量级一致,属粗略风控标定,非精确）。
+    weights（可选,默认 None=等权,向后兼容）：与 eq_codes 对齐的持仓权重序列,给定时按
+    Σ(wᵢ·rᵢ)/Σwᵢ 算加权组合日收益而非等权平均,使 inv_vol 下标定更贴合实际持仓。
+    无效（长度不符/全 0/Nan/负值）自动退化为等权,向后兼容。"""
     # 1) 取每只持仓股票最近 window+1 个收盘价（算 window 个日收益需要多一个点）
     series = []
     for c in eq_codes:
@@ -203,12 +211,21 @@ def _realized_vol(recent_closes, eq_codes, window):
         if arr is None or len(arr) < window + 1:
             return None
         series.append(arr[-(window + 1):])
-    # 2) 等权组合每日收益 = 当日各标的收益的平均
+    # 解析 weights：None/长度不符/全≤0 → 等权（向后兼容；负权无意义,截到 0 后若全 0 退等权）
+    n_eq = len(eq_codes)
+    if weights and len(weights) == n_eq:
+        w = [max(float(x), 0.0) for x in weights]
+        sw = sum(w)
+        if sw <= 0:
+            w = [1.0] * n_eq; sw = float(n_eq)      # 退等权
+    else:
+        w = [1.0] * n_eq; sw = float(n_eq)          # 等权（默认，向后兼容）
+    # 2) 组合每日收益 = 当日各标的收益按持仓权重加权（等权即平均）
     port = []
     for t in range(1, window + 1):
-        day = [s[t] / s[t - 1] - 1.0 for s in series if s[t - 1]]
-        if day:
-            port.append(sum(day) / len(day))
+        items = [(w[i], s[t] / s[t - 1] - 1.0) for i, s in enumerate(series) if s[t - 1]]
+        if items:
+            port.append(sum(wi * ri for wi, ri in items) / sw)
     if len(port) < 2:
         return None
     # 3) 日收益标准差 × √252 → 年化波动
@@ -281,6 +298,10 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
     target, picks = {}, []
     dcode = DEFENSE[0]
     dcode_cash = defense_cash or dcode   # B2 分档:动量≤0 / vol_target 挪货基(defense_cash),无则=国债
+    # 防御码集合(含两分档码;两者相等时即 {dcode})。step3-6 的 eq_codes 过滤统一用它——
+    # 否则当 defense_cash != DEFENSE[0]（如 511880 货基）时,只排 dcode(国债)会漏排 dcode_cash(货基),
+    # 导致货基被 vol/trend/crash/drawdown 当成股票缩放、proceeds 路由错乱,破坏 B2 分档设计。
+    defense_codes = {dcode, dcode_cash}
 
     if hold_all:
         # J2 对照（诊断用，非部署）：跳过动量选股（top_n 排序）与绝对动量（≤0 切防守），
@@ -323,15 +344,20 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         # C3 单标的集中度上限(默认 None 关):个股权重超 max_weight 的部分挪防守资产。
         #   等权 top_n=3 下单只≈33%、默认不触发;启用 inv_vol(C1)或集中 top_n 时可设(如 0.40)。
         if max_weight:
-            for c in [c for c in target if c != dcode and target[c] > max_weight]:
+            for c in [c for c in target if c not in defense_codes and target[c] > max_weight]:
                 excess = target[c] - max_weight
                 target[c] = max_weight
                 target[dcode_cash] = target.get(dcode_cash, 0.0) + excess
 
     # === 第三步：波动率目标。组合近期波动超标 → 整体缩股票仓，缩出来的挪进防守资产 ===
-    eq_codes = [c for c in target if c != dcode]   # 真正持有的股票（不含国债）
+    eq_codes = [c for c in target if c not in defense_codes]   # 真正持有的股票（不含任何防御码）
     if vol_target and eq_codes:
-        rv = _realized_vol(recent_closes, eq_codes, vol_window)
+        # 把当前持仓权重传给 _realized_vol,使 inv_vol 加权下标定贴合实际持仓
+        # （等权时 weights 各项相等,_realized_vol 退化为等权组合 vol,与原行为一致）。
+        # hold_all 路径不构造 weights 字典(始终等权),仅非 hold_all 的 inv_vol 分支传实际权重。
+        rv_w = ([weights.get(c, cash_buffer / top_n) for c in eq_codes]
+                if (weighting == "inv_vol" and not hold_all) else None)
+        rv = _realized_vol(recent_closes, eq_codes, vol_window, weights=rv_w)
         if rv and rv > vol_target:                 # 只在波动超标时降仓（不加杠杆）
             scale = vol_target / rv                # 缩放系数 <1
             for c in eq_codes:
@@ -343,7 +369,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
     #     与波动率目标是两套独立的"减仓"机制，可叠加：波动目标管"波动太大"，
     #     趋势过滤管"大盘方向向下"。两者都只减不加。
     if trend_ma and _below_trend(recent_closes, trend_code, trend_ma):
-        eq_codes = [c for c in target if c != dcode]   # 此刻仍持有的股票（可能已被波动目标缩过）
+        eq_codes = [c for c in target if c not in defense_codes]   # 此刻仍持有的股票（可能已被波动目标缩过）
         for c in eq_codes:
             moved = target[c] * (1 - trend_cut)        # 按"保留比例"缩仓
             target[c] *= trend_cut
@@ -358,7 +384,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         if arr and len(arr) > crash_lookback + 1:
             past, now = arr[-1 - crash_lookback], arr[-1]
             if _is_num(past) and _is_num(now) and past > 0 and now / past - 1 >= crash_thr:
-                for c in [c for c in target if c != dcode]:
+                for c in [c for c in target if c not in defense_codes]:
                     moved = target[c] * (1 - crash_cut)
                     target[c] *= crash_cut
                     target[dcode] = target.get(dcode, 0.0) + moved
@@ -372,7 +398,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
         if arr and len(arr) > dd_window:
             peak = max(arr[-dd_window:]); now = arr[-1]
             if _is_num(peak) and _is_num(now) and peak > 0 and (now - peak) / peak <= dd_thr:
-                for c in [c for c in target if c != dcode]:
+                for c in [c for c in target if c not in defense_codes]:
                     moved = target[c] * (1 - dd_cut)
                     target[c] *= dd_cut
                     target[dcode] = target.get(dcode, 0.0) + moved

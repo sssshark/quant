@@ -86,7 +86,14 @@ def _load_hold_all():
             with open(cfg, "r", encoding="utf-8") as f:
                 v = json.load(f).get("hold_all")
                 if v is not None:
-                    return bool(v)
+                    # 只接受真 JSON bool（true/false）。⚠ 旧 `bool(v)` 对字符串
+                    # "false"/"0" 返回 True（非空串皆真）→ 用户误把值加引号会静默
+                    # 跑成"等权全池"。非 bool 值一律告警并回退默认，杜绝误判。
+                    if isinstance(v, bool):
+                        return v
+                    print(f"[warn] live_config.json 的 hold_all 应为 true/false(bool)，"
+                          f"当前为 {v!r}({type(v).__name__})，用默认 {HOLD_ALL}。")
+                    return HOLD_ALL
         except Exception as e:
             print(f"[warn] 读 live_config.json 的 hold_all 失败（{e}），用默认 {HOLD_ALL}。")
     return HOLD_ALL
@@ -161,8 +168,13 @@ def read_account(ctx, price):
 
 # ---------------- 3) 生成调仓订单 ----------------
 def _market(code):
-    """补市场后缀：5/1 开头沪市(.SH)，其余(15/16/...)深市(.SZ)。"""
-    return code + (".SH" if code[0] in "51" else ".SZ")
+    """补市场后缀：5xx/6xx 沪市(.SH)，1xx/0xx/3xx 深市(.SZ)。
+
+    ⚠ 旧实现 `code[0] in "51"` 是子串包含不是集合判断——`"1" in "51"`=True，
+    致 159915(创业板)/159941(跨境)等 1xx 深市代码被误判 .SH。paper 路径
+    `paper_broker.order` 内部 `code.split('.')[0]` 剥后缀故从不暴露；切到 qmt
+    实盘会向上交所下深市代码→拒单。显式按首字符前缀判断（5/6→沪，其余→深）。"""
+    return code + (".SH" if code[0] in ("5", "6") else ".SZ")
 
 
 def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
@@ -207,6 +219,27 @@ def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
             if code in cant_buy_today:                  # D2：涨停买不进，跳过
                 continue
             buys.append((code, "BUY", tgt - held))      # 目标比持有多 → 买差额
+
+    # 买单现金兜底（deepcode-3 修复）：四舍五入到整百（D5）每只最多多买 50 股，top3 同时
+    # 五入可超 1% cash_buffer 兜底，致现金为负（paper）或部分成交（qmt）。先卖后买口径下，
+    # 可用现金 = 当前现金 + 卖单回笼（扣滑点）；逐笔买单按可用现金截断股数（向下取整到 LOT），
+    # 超出部分自然落现金——宁可小幅欠配，不超支。
+    if buys:
+        cash = total - sum(positions.get(c, 0) * price.get(c, 0.0)
+                           for c in set(positions) | set(want))
+        for code, side, sh in sells:                     # 卖单回笼（扣滑点近似）
+            cash += sh * price.get(code, 0.0) * (1 - SLIPPAGE)
+        capped = []
+        for code, side, sh in buys:
+            px = price.get(code, 0.0)
+            if px <= 0:
+                continue
+            affordable = int(cash / (px * (1 + SLIPPAGE) * LOT)) * LOT   # 含滑点的可买整百
+            sh = min(sh, affordable)
+            cash -= sh * px * (1 + SLIPPAGE)            # 扣减已用现金
+            if sh > 0:
+                capped.append((code, side, sh))
+        buys = capped
     return sells + buys                     # 列表相加 = 先卖单后买单，保证先回笼现金
 
 

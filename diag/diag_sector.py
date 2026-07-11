@@ -53,10 +53,11 @@ def fetch_etf(code, start="20120101"):
     """tushare HTTP 拉单只 ETF 前复权(复用 engine._qfq_from_pre_close,口径同 _load_via_tushare)。"""
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo 根(找 .tushare_token)
     token = open(os.path.join(here, ".tushare_token"), encoding="utf-8").read().strip()
-    api = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
+    api = os.environ.get("TUSHARE_API", "http://47.116.63.181:8000/dataapi")
     tc = code + (".SH" if code[0] in "5" else ".SZ")
-    r = requests.post(api, json={"api_name": "fund_daily", "token": token,
-                      "params": {"ts_code": tc, "start_date": start, "end_date": "20260708"},
+    r = requests.post(f"{api.rstrip('/')}/fund_daily",
+                      json={"token": token,
+                      "params": {"ts_code": tc, "start_date": start, "end_date": pd.Timestamp.today().strftime("%Y%m%d")},
                       "fields": "trade_date,close,pre_close"},
                       headers={"Accept-Encoding": "gzip"}, timeout=30)
     j = r.json()

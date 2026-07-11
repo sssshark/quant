@@ -77,7 +77,8 @@ def _qfq_from_pre_close(close, pre_close):
 
 def _load_via_tushare(with_limits=False):
     """tushare 前复权（根治 E2）。代理 URL 由 TUSHARE_API 环境变量指定（可选，
-    默认代理 fastapic.stockai888.top）。token 优先 TUSHARE_TOKEN 环境变量，其次本地
+    默认代理 http://47.116.63.181:8000/dataapi，http 明文中转——token 与查询参数
+    均明文经此服务器）。token 优先 TUSHARE_TOKEN 环境变量，其次本地
     .tushare_token 文件（gitignore，不入库，方便不设环境变量直接跑）；两者都无返回 None。
 
     关键：tushare 的 pro_bar(adj='qfq') 对 ETF(asset='FD') 不生效（返回不复权），故用
@@ -95,13 +96,15 @@ def _load_via_tushare(with_limits=False):
     if not token:
         return None
     import requests, time
-    api_url = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
+    api_url = os.environ.get("TUSHARE_API", "http://47.116.63.181:8000/dataapi")
     def _ts_post(api_name, params, fields):
         """tushare Pro HTTP POST（服务商文档“方式二”，绕开 SDK 的 lxml 依赖链——
         本机 termux 装 tushare SDK 卡在 lxml 源码编译、无 cp314 aarch64 wheel，SDK 顶层
-        import 即失败）。token 直接进请求体，不再受 SDK 层环境变量干扰代理的坑影响。"""
-        r = requests.post(api_url, json={"api_name": api_name, "token": token,
-                                         "params": params, "fields": fields},
+        import 即失败）。token 直接进请求体，不再受 SDK 层环境变量干扰代理的坑影响。
+        当前中转(47.116.63.181)走 path 式路由——api_name 进 URL path(/dataapi/{api_name})，
+        body 只剩 token/params/fields；旧 fastapic 中转把 api_name 放 body，URL 末尾不带 path。"""
+        r = requests.post(f"{api_url.rstrip('/')}/{api_name}",
+                          json={"token": token, "params": params, "fields": fields},
                           headers={"Accept-Encoding": "gzip"}, timeout=30)
         j = r.json()
         if j.get("code") != 0:
@@ -113,8 +116,23 @@ def _load_via_tushare(with_limits=False):
     series = {}
     raw_d = {}; pre_d = {}                                 # 未复权（涨跌停判定用，D2）
     for c in ALL_CODES:
-        fd = _ts_post("fund_daily", {"ts_code": tc(c), "start_date": "20130101", "end_date": end},
-                      "trade_date,close,pre_close")
+        # E6 per-symbol 有界重试+退避：单次 transient 失败（网络抖/限频 RuntimeError）不再杀掉
+        # 整次加载——镜像 eastmoney 的 4 次重试。最终失败则 loud warning 跳过该 symbol（该列
+        # 缺失，下游 concat+dropna/anchor 自然处理），不静默降级到 eastmoney（换口径）。
+        fd = None
+        last_err = None
+        for attempt in range(4):
+            try:
+                fd = _ts_post("fund_daily", {"ts_code": tc(c), "start_date": "20130101", "end_date": end},
+                              "trade_date,close,pre_close")
+                break
+            except Exception as exc:
+                last_err = exc
+                if attempt == 3:
+                    print(f"[E6 告警] {c} tushare fund_daily 4 次重试仍失败,跳过该标的: {exc}")
+                time.sleep(2 * (attempt + 1))              # 2/4/6/8s 退避（tushare 限频,短于东财）
+        if fd is None:
+            continue                                        # loud warning 已打,跳过该 symbol
         fd["date"] = pd.to_datetime(fd["trade_date"])
         fd = fd.set_index("date").sort_index()             # fund_daily 返回本就是未复权价
         close = fd["close"].astype(float)                  # 未复权收盘（前复权由下面手动算）
@@ -126,11 +144,19 @@ def _load_via_tushare(with_limits=False):
         adj = _qfq_from_pre_close(close, pre_d[c])
         adj.name = c
         series[c] = adj
-    px = pd.concat(series, axis=1, sort=False).sort_index().ffill().dropna(how="all")
+    # 全部 symbol 重试皆败（如 token 失效——非 transient）→ 返回 None 降级东财,而非空 concat 崩溃
+    if not series:
+        print("[E6 告警] tushare 所有标的拉取皆败,降级东财 akshare(换口径,仅兜底)")
+        return None
+    # E7 有界 ffill：只向前填 ≤3 交易日，更长 gap（停牌/未上市）留 NaN——避免无界 ffill 把
+    # 停牌日填成平稳价、0% 收益喂给 _realized_vol（压低 vol→vol_target 不缩仓）与
+    # blended_momentum（稀释趋势）。cta.blended_momentum/_asset_daily_vol 已 skip NaN，
+    # engine 回测 rets=px.pct_change().fillna(0.0) 使停牌日显式 0 收益而非平稳价。
+    px = pd.concat(series, axis=1, sort=False).sort_index().ffill(limit=3).dropna(how="all")
     px = _anchor_start(px)
     if with_limits:
-        raw = pd.concat(raw_d, axis=1).sort_index().ffill()
-        pc = pd.concat(pre_d, axis=1).sort_index().ffill()
+        raw = pd.concat(raw_d, axis=1).sort_index().ffill(limit=3)
+        pc = pd.concat(pre_d, axis=1).sort_index().ffill(limit=3)
         raw = raw.reindex(px.index)[px.columns]            # 对齐到 px 的索引/列（同源，reindex 不引入 NaN）
         pc = pc.reindex(px.index)[px.columns]
         cb, cs = limit_masks(raw, pc)
@@ -165,7 +191,7 @@ def _load_via_eastmoney(with_limits=False):
         df["日期"] = pd.to_datetime(df["日期"])
         series[c] = df.set_index("日期")["收盘"].astype(float).rename(c)
     px = pd.concat(series.values(), axis=1).sort_index()
-    px = px.dropna(how="all").ffill()
+    px = px.dropna(how="all").ffill(limit=3)               # E7 有界 ffill(同 tushare 路径,停牌>3日留 NaN)
     px = _anchor_start(px)
     if with_limits:
         cb, cs = limit_masks(px.copy(), px.shift(1))      # 复权环比近似
@@ -185,12 +211,22 @@ def limit_masks(raw_close, raw_pre_close):
     盘中封板尾盘开板（close 未触板）则视作能成交。"""
     cant_buy = pd.DataFrame(False, index=raw_close.index, columns=raw_close.columns)
     cant_sell = pd.DataFrame(False, index=raw_close.index, columns=raw_close.columns)
+    # A 股涨跌停按"分"取整,官方规则是四舍五入(ROUND_HALF_UP),不是 numpy 的银行家舍入
+    # (half-to-even)。.round(2) 用 numpy 银行家舍入:pc=0.95×1.1=1.045,A 股涨停=1.05,
+    # numpy round 给 1.04 → close=1.04(未触板)被误判 cant_buy=True。用 decimal 的
+    # ROUND_HALF_UP 修正 .x5 边界(pre_close: 0.15/0.25/0.35/0.75/0.95/1.15/1.95 等)。
+    from decimal import Decimal, ROUND_HALF_UP
+    def _rup(s):
+        """Series/标量 → 按"分"四舍五入(ROUND_HALF_UP)的 float Series/标量。"""
+        if hasattr(s, "map"):                           # pandas Series
+            return s.map(lambda x: float(Decimal(str(float(x))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)))
+        return float(Decimal(str(float(s))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     for code in raw_close.columns:
         lim = _limit(code)
         pc = raw_pre_close[code]
         cl = raw_close[code]
-        cant_buy[code] = cl >= (pc * (1 + lim)).round(2)
-        cant_sell[code] = cl <= (pc * (1 - lim)).round(2)
+        cant_buy[code] = cl >= _rup(pc * (1 + lim))
+        cant_sell[code] = cl <= _rup(pc * (1 - lim))
     return cant_buy, cant_sell
 
 
@@ -607,7 +643,7 @@ def regime_labels(px, bear_dd=-0.20, trend_ma=200):
     """按基准（沪深300）市场状态给每日打 regime 标签（改进项 F3）：
     熊市=从历史高点回撤超 bear_dd（默认20%）；牛市=非熊 且净值在 trend_ma 日均线之上；
     震荡=其余。用基准而非策略净值，刻画的是"市场 regime"本身、与持仓无关。"""
-    bench = px[BENCH].ffill().dropna()
+    bench = px[BENCH].ffill(limit=3).dropna()   # 有界 ffill(E7)：只填 ≤3 日的短停牌 gap，更长 gap 留 NaN 被 dropna 丢弃
     nav = (1 + bench.pct_change().fillna(0)).cumprod()
     nav = nav / nav.iloc[0]
     dd = nav / nav.cummax() - 1                       # 回撤序列（负值）
@@ -1089,8 +1125,10 @@ def deflated_sharpe(daily, n_trials, periods=252):
       σ(SR̂) = √[(1 − γ₃·SR̂ + (γ₄−1)/4·SR̂²)/(n−1)]   （Mertens/Lo 非正态修正，肥尾左偏会放大 σ）
       SR_max = σ · [(1−γ_emc)·Φ⁻¹(1−1/N) + γ_emc·Φ⁻¹(1−1/(N·e))]   （N 次试验期望最高，γ_emc=Euler-Mascheroni≈0.5772）
       DSR    = Φ((SR̂ − SR_max)/σ)；PSR0 = Φ(SR̂/σ)（基准=0，即"真实夏普>0 的概率"）
-    返回 dict。注：N 是"等效独立试验数"的保守估计——真实研究里多数试验因不显著被弃、未真正
-    用于选参，故真实 N 更小、真实 DSR 更高（此处 N 偏大 → DSR 偏保守，是存疑方向上的下界）。"""
+    返回 dict。注：N 是"等效独立试验数"。N 偏大→SR_max 抬高→DSR 降低,故 N 越大越保守。
+    [10,50,100] 仅覆盖最乐观下界;按 backlog(49 行 A/B 选参 + 27 族 + robust 7 轴×5 + WF_GRID 8 +
+    sweep)的等效试验量级,真实 N 约 200-500——届时日频 DSR 落 0.85-0.91、月频落 0.90-0.94,
+    '经得起多重比较'(DSR>0.95)不再在两口径同时成立。故扫描须扩到 1000 以暴露此敏感性。"""
     r = daily.values if hasattr(daily, "values") else list(daily)
     n = len(r)
     mean = sum(r) / n
@@ -1117,7 +1155,10 @@ def _monthly_returns(daily):
 def run_dsr(px):
     """对部署策略(等权 + 全风控)与 C1 反向波动版算 Deflated Sharpe Ratio。
     **J3**:同时报日频(n≈3225,自由度被夸大、乐观上界)与月频(n≈152,月收益近 i.i.d.、可信下界)两种口径,
-    让"夏普可信度"不被日收益的伪独立观测抬高。N 取 [10,50,100] 多重比较敏感性。"""
+    让"夏普可信度"不被日收益的伪独立观测抬高。N 扫 [10,50,100,200,500,1000]——[10,50,100] 仅覆盖最
+    乐观;按 backlog 量级真实 N 约 200-500。实测(2026-07-11):日频 N=200→0.892、N=500→0.829、N=1000→0.772
+    (跌破 0.95);月频 N=200→0.996、N=500→0.992、N=1000→0.986(仍 >0.95)。故'经得起多重比较'在日频口径
+    失守、月频口径仍稳——扫描须扩到 1000 才看得到日频的失守。"""
     _, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA)
     _, ret_iv, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, weighting="inv_vol")
     pairs = [("等权+全风控", ret_tr), ("反向波动+全风控", ret_iv)]
@@ -1128,7 +1169,7 @@ def run_dsr(px):
         print(f"{'策略':<20}{'观测夏普':>9}{'N(试验)':>9}{'SR_max':>8}{'DSR':>8}{'PSR(>0)':>9}{'判读':>8}")
         for name, daily in pairs:
             rs = _monthly_returns(daily) if freq == "月频" else daily
-            for N in (10, 50, 100):
+            for N in (10, 50, 100, 200, 500, 1000):
                 r = deflated_sharpe(rs, N, periods=periods)
                 verdict = "可信" if r["DSR"] > 0.95 else ("边际" if r["DSR"] > 0.90 else "不足")
                 print(f"{name:<20}{r['SR_ann']:>9.3f}{N:>9}{r['SR_max_ann']:>8.3f}"
@@ -1140,7 +1181,10 @@ def run_dsr(px):
     print(f"  [J3 对比] 等权策略 DSR@N=50:日频 {d:.3f} → 月频 {m:.3f} ({m-d:+.3f})")
     print("  解读:日收益自相关 + edge 集中在少数熊市 regime,日频 n≈3225 高估了独立观测数;")
     print("        月频 n≈152 不依赖'日收益独立'假设,是更诚实的可信度。两口径都 >0.95 才算硬。")
-    print("        N(试验)越小扣减越轻;真实独立试验数远小于 100(多数改进验证后被弃),真实 DSR 高于 N=100 列。")
+    print("        N(试验)越小扣减越轻(=越乐观)。[10,50,100] 仅是最乐观的扫,N 越大越保守。")
+    print("        按 backlog(49 行 A/B 选参 + 27 族 + robust/WF/sweep)的等效试验量级,真实 N 约 200-500。")
+    print("        实测:日频 N=200→0.892/500→0.829/1000→0.772(跌破 0.95);月频 N=200→0.996/500→0.992/1000→0.986(仍 >0.95)。")
+    print("        故'经得起多重比较'(DSR>0.95)在日频口径失守、月频口径仍稳——诚实结论是'月频可信、日频在真实试验数下不足'。")
 
 
 # ---------------- universe：标的池消融（alpha 对池子构成的依赖）----------------
@@ -1471,7 +1515,7 @@ def run_multi(px, lim=None):
 
     # ===== 阶段2 第一枪:K=2 组合(CTA + 国债时序动量)=====
     # 国债时序动量是三候选里唯一通过"互补+自身+组合增益"三道关的第二策略(diag_bonds 实测:
-    # 夏普 1.5、与 CTA 相关性 -0.06~-0.11 股债跷跷板、50/50 组合夏普 1.29 > 单 CTA 1.01)。
+    # 夏普 1.5、与 CTA 相关性 -0.115 股债跷跷板、50/50 组合夏普 1.29 > 单 CTA 1.01)。
     from multi_strategy import BondMomentumStrategy
     print()
     print("=" * 64)

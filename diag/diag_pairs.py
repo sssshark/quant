@@ -13,7 +13,8 @@
   1. 协整筛选:POOL 全部两两 Engle-Granger coint 检验,选 p<阈值的协整对。
      (注:全样本选对含前视,仅用于判断互补性是否存在,非实盘表现。)
   2. 配对交易回测(每对 dollar-neutral + beta-hedge):滚动 z-score(60日),entry±2/exit±0.5,
-     T+1 成交,换手扣 COMMISSION+SLIPPAGE。⚠️ 未计做空融券成本 → 结果是上界。
+     T+2 吃收益口径(信号 T→成交 T+1→收益 T+2,对齐 engine.backtest / diag_bonds2 / diag_sector),
+     换手扣 COMMISSION+SLIPPAGE。⚠️ 未计做空融券成本 → 结果是上界。
   3. vs CTA 相关性(全样本/分regime)+ 组合增益(50/50)。
 
 判定:与 CTA 近零相关(市场中性应≈0)+ 配对自身正收益 + 组合增益 → 值得探索做空实现路径。
@@ -79,8 +80,10 @@ def pair_backtest(px, a, b):
     pos = pair_positions(z, ENTRY, EXIT)
     ra = s[a].pct_change().fillna(0.0)
     rb = s[b].pct_change().fillna(0.0)
-    gross = pos.shift(1).fillna(0) * (0.5 * ra - 0.5 * beta * rb)     # T+1 成交防前视
-    turnover = pos.diff().abs().fillna(0) * 0.5 * (1 + abs(beta))     # 双边换手近似
+    pos_exec = pos.shift(1).fillna(0)                                   # T+1 成交(防前视)
+    w_lag = pos_exec.shift(1).fillna(0)                                # 再 shift = T+2 吃收益(对齐 engine.backtest / diag_bonds2 / diag_sector)
+    gross = w_lag * (0.5 * ra - 0.5 * beta * rb)
+    turnover = (pos_exec - pos_exec.shift(1).fillna(0)).abs() * 0.5 * (1 + abs(beta))   # 双边换手近似(用成交口径)
     cost = turnover * (COMMISSION + SLIPPAGE)
     net = (gross - cost).fillna(0.0)
     nav = (1 + net).cumprod()

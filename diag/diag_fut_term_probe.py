@@ -21,14 +21,15 @@ from diag_sector import fetch_etf
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo 根(找 .tushare_token)
 TOKEN = open(os.path.join(HERE, ".tushare_token"), encoding="utf-8").read().strip()
-API = os.environ.get("TUSHARE_API", "https://fastapic.stockai888.top")
+API = os.environ.get("TUSHARE_API", "http://47.116.63.181:8000/dataapi")
 
 
 def ts_post(api_name, params, fields=None, retries=4):
     """代理偶发 SSL/读超时,重试 + 容错(失败返回 None,不抛——单合约失败跳过不中断)。"""
     for attempt in range(retries):
         try:
-            r = requests.post(API, json={"api_name": api_name, "token": TOKEN,
+            r = requests.post(f"{API.rstrip('/')}/{api_name}",
+                              json={"token": TOKEN,
                               "params": params, "fields": fields or ""},
                               headers={"Accept-Encoding": "gzip"}, timeout=25)
             j = r.json()
@@ -49,7 +50,7 @@ def gen_contracts(prefix, exch, years=range(2018, 2028)):
 
 
 def fetch_contract_settle(ts_code):
-    df = ts_post("fut_daily", {"ts_code": ts_code, "start_date": "20180101", "end_date": "20260708"},
+    df = ts_post("fut_daily", {"ts_code": ts_code, "start_date": "20180101", "end_date": pd.Timestamp.today().strftime("%Y%m%d")},
                  "trade_date,settle")
     if df is None or len(df) == 0:
         return None

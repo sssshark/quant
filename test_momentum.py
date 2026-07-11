@@ -236,6 +236,36 @@ def test_limit_masks():
     assert bool(cs.loc[idx[0], "510300"]) is False
 
 
+def test_defense_cash_not_scaled_by_trend():
+    """B2 分档回归:defense_cash != DEFENSE[0]（如 511880 货基）时,step2b/step3 把权重挪到
+    dcode_cash(货基),但 step4-6 的 eq_codes 过滤必须同时排除两防御码——否则货基被 trend/
+    crash/drawdown 当成股票缩放,破坏 B2 分档。本测构造"负动量切货基 + 趋势触发"场景,
+    断言货基权重不被 step4 trend_cut 缩放、proceeds 正确路由到国债(dcode)。
+    合成:510300(trend_code,先涨后跌破 200MA→趋势触发且负动量),510500/159915(单调上涨→正动量),
+    仅这 3 只有足够历史 → top_n=3 全入选,510300 动量≤0 → 其 1/3 权重切货基 511880;
+    趋势触发 → 510500/159915 各按 0.5 缩仓、半数挪国债 511010;货基 511880 须原样保留(0.33)。"""
+    n = 260
+    p300 = np.concatenate([np.linspace(4.0, 5.0, 200), np.linspace(5.0, 3.5, 60)])  # 跌破 200MA
+    base = {
+        "510300": p300.tolist(),                          # 负动量 + 趋势触发源
+        "510500": np.linspace(5.0, 7.0, n).tolist(),      # 正动量
+        "159915": np.linspace(1.5, 2.5, n).tolist(),      # 正动量
+        "511010": np.linspace(100, 101, n).tolist(),      # 国债(dcode)
+        "511880": np.linspace(100, 100.5, n).tolist(),    # 货基(dcode_cash,≠国债)
+    }
+    t, _ = mc.decide_targets(base, vol_target=None, trend_ma=200, defense_cash="511880", top_n=3)
+    assert mc._below_trend(base, "510300", 200) is True                  # 前提:趋势确触发
+    w_cash = t.get("511880", 0.0)                                        # 货基(负动量切仓去向)
+    w_bond = t.get("511010", 0.0)                                        # 国债(trend proceeds 去向)
+    # 510300 负动量 → 其 cash_buffer/3 切到货基 511880,须原样保留(不被 trend 减半)
+    assert abs(w_cash - mc.CASH_BUFFER / 3) < 1e-9, f"货基被误缩: {w_cash} ≠ {mc.CASH_BUFFER/3}"
+    # 510500/159915 各 cash_buffer/3,趋势砍半 → 各保留 0.165、半数 0.165 挪国债
+    # 国债 = 0.165+0.165 = 0.33;两权益各 0.165
+    assert abs(w_bond - mc.CASH_BUFFER / 3) < 1e-9, f"国债 proceeds 路由错: {w_bond}"
+    assert abs(t["510500"] - mc.CASH_BUFFER / 6) < 1e-9
+    assert abs(t["159915"] - mc.CASH_BUFFER / 6) < 1e-9
+
+
 def test_qfq_from_pre_close():
     """E3 复权:除权日 pre_close≠昨收 → 前复权把历史价格按因子拉回,消除跳变;最新价不变。
     合成 5 日,day2 除权(昨收 10→今日 pre_close=8、close=8,0.8 因子)。"""
@@ -360,6 +390,56 @@ def test_riskparity_k2_diversification():
     _, ret_c, _, _ = e.backtest(px, strategy=cta)
     _, ret_rp, _, _ = e.backtest(px, strategy=RiskParityMulti([cta, bond]))
     assert ret_rp.std() * np.sqrt(252) < ret_c.std() * np.sqrt(252), "risk-parity 组合波动未低于单 CTA"
+
+
+def test_market_suffix():
+    """Q1/deepcode-1: _market 市场后缀——5xx 沪市 .SH、1xx(159xxx 创业板/跨境)深市 .SZ。
+    回归保护:旧 `code[0] in "51"` 子串陷阱把 159915/159941 误判 .SH(qmt 实盘会拒单)。"""
+    assert L._market("159915") == "159915.SZ"   # 创业板(深)——旧 bug 返回 .SH
+    assert L._market("159941") == "159941.SZ"   # 跨境纳指(深)
+    assert L._market("510300") == "510300.SH"   # 沪深300(沪)
+    assert L._market("511010") == "511010.SH"   # 国债(沪)
+    assert L._market("518880") == "518880.SH"   # 黄金(沪)
+
+
+def test_build_orders_cash_cap():
+    """Q1/deepcode-3: 买单现金兜底——top3 全向上四舍五入时不得超支(total),现金保持非负。
+    旧实现四舍五入每只最多 +50 股,5 只同时五入可超 cash_buffer 兜底上限→现金为负。"""
+    total = 100_000
+    # 5 只标的各 0.198 权重(Σ0.99),价格选成 w*total/px/LOT 小数部分≥0.5 → 全向上五入
+    px = 76.15
+    target = {c: 0.198 for c in "ABCDE"}
+    recent = {c: [1.0, px] for c in "ABCDE"}
+    orders = L.build_orders(target, recent, total, {})
+    buys = [sh for _, s, sh in orders if s == "BUY"]
+    # 含滑点后总投资不得超 total(现金非负)
+    invested = sum(sh * px * (1 + mc.SLIPPAGE) for sh in buys)
+    assert invested <= total + 1e-6, f"现金超支: invested {invested:.0f} > total {total}"
+    # 不截断的话 5×300×76.15=114225 会超 14225;截断后必有一只被砍
+    assert max(buys) <= 300 and sum(buys) * px < total  # 总买入市值受控
+
+
+def test_load_hold_all_strict_bool():
+    """Q1/deepcode-4: _load_hold_all 只认 JSON bool,字符串 "false"/"0" 告警回退默认(False)。
+    回归保护:旧 `bool(v)` 对非空字符串返回 True → 用户误写 "false" 静默跑成等权全池。"""
+    import json
+    cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_config.json")
+    existed = os.path.exists(cfg)
+    saved = open(cfg).read() if existed else None
+    try:
+        for bad in ("false", "0", "true", "yes"):  # 字符串一律不应是 True
+            with open(cfg, "w") as f:
+                json.dump({"hold_all": bad}, f)
+            assert L._load_hold_all() is False, f"字符串 {bad!r} 应回退默认 False,非 True"
+        # 真 JSON bool 仍正常
+        with open(cfg, "w") as f:
+            json.dump({"hold_all": True}, f)
+        assert L._load_hold_all() is True
+    finally:
+        if existed:
+            open(cfg, "w").write(saved)
+        elif os.path.exists(cfg):
+            os.remove(cfg)
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

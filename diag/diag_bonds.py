@@ -48,7 +48,8 @@ def bond_buyhold(px):
 
 
 def bond_momentum(px, with_trend=False):
-    """国债时序动量:混合动量(21/63/126 日)>0 持有、<=0 空仓,月末调仓,T+1 成交。
+    """国债时序动量:混合动量(21/63/126 日)>0 持有、<=0 空仓,月末调仓,T+2 吃收益口径对齐
+    engine.backtest(signal T→execute T+1→w_lag=shift(1)→收益 T+2)。
     with_trend:额外要求价>MA200(同 CTA trend filter 口径)。"""
     p = px[BOND]
     month_ends = px.resample("ME").last().index
@@ -61,10 +62,11 @@ def bond_momentum(px, with_trend=False):
     if with_trend:
         sig = sig & (p > p.rolling(200).mean())
     pos = sig.where(sig.index.isin(rd_set)).ffill().fillna(0.0)    # 月末采样 + 持有到下月末
-    pos = pos.shift(1).fillna(0.0)                                 # T+1 成交防前视
+    pos_exec = pos.shift(1).fillna(0.0)                            # T+1 成交(防收盘瞬时成交前视)
+    w_lag = pos_exec.shift(1).fillna(0.0)                          # 再 shift = T+2 吃收益(对齐 engine.backtest)
     ret = p.pct_change().fillna(0.0)
-    gross = pos * ret
-    turnover = pos.diff().abs().fillna(0.0)
+    gross = w_lag * ret
+    turnover = (pos_exec - pos_exec.shift(1).fillna(0.0)).abs()
     cost = turnover * (COMMISSION + SLIPPAGE)
     net = (gross - cost).fillna(0.0)
     start = rebal[0]

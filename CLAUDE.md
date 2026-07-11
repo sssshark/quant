@@ -49,7 +49,7 @@ The central design rule: **strategy logic lives in exactly one place** — `cta.
 
 ## Data & secrets
 
-- tushare over proxy `https://fastapic.stockai888.top`; token read from `.tushare_token` (or `TUSHARE_API`/`TUSHARE_TOKEN` env). Retry with backoff on the proxy's intermittent SSL/read timeouts.
+- tushare over relay `http://47.116.63.181:8000/dataapi` (path-style routing: `api_name` goes in the URL path, not the JSON body; http plaintext — token & query params traverse this server); token read from `.tushare_token` (or `TUSHARE_API`/`TUSHARE_TOKEN` env). The old `https://fastapic.stockai888.top` relay used body-style routing — switching back requires reverting the request construction, not just the URL. Retry with backoff on the relay's intermittent read timeouts.
 - **Gitignored, never commit**: `.tushare_token`, `live_config.json`, `paper_account.json`, `last_rebalance.txt`, `usdata/`, `ETF动量轮动_回测结果.png`. Verify before every commit with `git check-ignore <file>`.
 
 ## Writing & conventions

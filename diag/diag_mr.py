@@ -68,13 +68,15 @@ def mr_weights(px, use_gate):
 
 
 def mr_backtest(px, use_gate):
-    """跑均值回归回测,返回 (nav, daily_net)。T+1 成交防前视,换手扣 COMMISSION+SLIPPAGE。"""
+    """跑均值回归回测,返回 (nav, daily_net)。T+2 吃收益口径对齐 engine.backtest
+    (signal T→execute T+1→w_lag=shift(1)→收益 T+2),换手扣 COMMISSION+SLIPPAGE。"""
     weights = mr_weights(px, use_gate)
     cols = MR_CODES + [DEFENSE[0]]
-    w_lag = weights.shift(1).fillna(0.0)            # 昨天收盘的权重吃今天的收益(防前视)
+    pos_exec = weights.shift(1).fillna(0.0)         # T+1 成交(防收盘瞬时成交前视)
+    w_lag = pos_exec.shift(1).fillna(0.0)           # 再 shift = T+2 吃收益(对齐 engine.backtest)
     rets = px[cols].pct_change().fillna(0.0)
     gross = (w_lag * rets).sum(axis=1)
-    turnover = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
+    turnover = (pos_exec - pos_exec.shift(1).fillna(0.0)).abs().sum(axis=1)
     cost = turnover * (COMMISSION + SLIPPAGE)
     net = gross - cost
     start = weights.dropna().index[0]               # z 与(若开)gate 都有效的首日
