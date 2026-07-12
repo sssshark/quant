@@ -13,8 +13,9 @@
   - 需先在华泰开通 miniQMT/极简模式权限，并让 QMT 客户端在后台登录运行。
   - 实盘凭证（QMT_PATH / ACCOUNT_ID）不写进代码：从「环境变量 > 本地 live_config.json」
     读取（见 _load_live_secret），配置方法见 live_config.example.json。
-  - 实盘建议 hold_all=true（等权全池+风控）：研究证明动量选股无可靠 alpha、跨市场甚至显著拖累
-    （J1/J2/J5/G3，详见 IMPROVEMENTS）。默认 hold_all=false 仅作策略展示；改 live_config.json 即可切换。
+  - hold_all 默认 true（等权全池+风控）：研究证明动量选股无可靠 alpha、跨市场甚至显著拖累
+    （J1/J2/J5/G3，详见 IMPROVEMENTS），故 2026-07-12 起默认改为 true、与实盘口径一致；
+    改 live_config.json 的 "hold_all" 可覆盖（false=动量轮动，诊断/对照用）。
   - 真金白银交易请你本人确认后执行；建议先在模拟账户跑通。
   - 程序化交易需按交易所要求报备。
 
@@ -78,8 +79,8 @@ DEMO_TOTAL = 100_000.0                            # 兜底：完全连不上时�
 
 def _load_hold_all():
     """读部署模式 hold_all:live_config.json 的 "hold_all" 键 > cta.HOLD_ALL 默认。
-    True = 等权全池+风控(J1/J2 证的稳健版:两市均显示动量选股无可靠 alpha,选股还略抬高回撤);
-    False = 动量轮动(默认)。非敏感的策略开关,故只读本地配置文件(不走环境变量)。"""
+    True = 等权全池+风控(默认;J1/J2 证两市动量选股均无可靠 alpha,选股还略抬高回撤);
+    False = 动量轮动(诊断/对照用)。非敏感的策略开关,故只读本地配置文件(不走环境变量)。"""
     cfg = os.path.join(os.path.dirname(__file__), "live_config.json")
     if os.path.exists(cfg):
         try:

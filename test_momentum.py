@@ -106,9 +106,12 @@ def test_reconcile():
     assert m_bad > 0.10
 
 
-def test_load_hold_all():
-    """J2 落地:live_config.json 的 hold_all 覆盖默认。临时写配置文件、跑完删,验证三级回退。"""
+def test_load_hold_all(monkeypatch):
+    """J2 落地:live_config.json 的 hold_all 覆盖默认。临时写配置文件、跑完删,验证三级回退。
+    本地锁默认 HOLD_ALL=False(monkeypatch),与全局默认解耦——2026-07-12 起全局默认改 True,
+    本测试仍验证"config 值覆盖 / 空键回退默认"的行为本身(不绑定默认的具体值)。"""
     import json, tempfile, crossmarket as cm  # noqa: F401 (cm 仅触发其 import 链)
+    monkeypatch.setattr(L, "HOLD_ALL", False)            # 锁本地默认 False,与全局默认解耦
     cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_config.json")
     existed = os.path.exists(cfg)
     saved = open(cfg).read() if existed else None
@@ -117,7 +120,7 @@ def test_load_hold_all():
             with open(cfg, "w") as f:
                 json.dump({"hold_all": val}, f)
             assert L._load_hold_all() is want
-        # 无 hold_all 键 → 回退默认 HOLD_ALL(False)
+        # 无 hold_all 键 → 回退本地默认(已 monkeypatch 锁 False)
         with open(cfg, "w") as f:
             json.dump({}, f)
         assert L._load_hold_all() is False
@@ -253,7 +256,10 @@ def test_defense_cash_not_scaled_by_trend():
         "511010": np.linspace(100, 101, n).tolist(),      # 国债(dcode)
         "511880": np.linspace(100, 100.5, n).tolist(),    # 货基(dcode_cash,≠国债)
     }
-    t, _ = mc.decide_targets(base, vol_target=None, trend_ma=200, defense_cash="511880", top_n=3)
+    # hold_all=False + drawdown_prot=False:本测专测"选股+绝对动量切防守+trend+B2 分档"路径——
+    # 须走选股分支(hold_all 默认 2026-07-12 起改 True),并隔离 C2(构造大跌会触发、干扰权重断言)。
+    t, _ = mc.decide_targets(base, vol_target=None, trend_ma=200, hold_all=False, drawdown_prot=False,
+                             defense_cash="511880", top_n=3)
     assert mc._below_trend(base, "510300", 200) is True                  # 前提:趋势确触发
     w_cash = t.get("511880", 0.0)                                        # 货基(负动量切仓去向)
     w_bond = t.get("511010", 0.0)                                        # 国债(trend proceeds 去向)
@@ -419,15 +425,18 @@ def test_build_orders_cash_cap():
     assert max(buys) <= 300 and sum(buys) * px < total  # 总买入市值受控
 
 
-def test_load_hold_all_strict_bool():
-    """Q1/deepcode-4: _load_hold_all 只认 JSON bool,字符串 "false"/"0" 告警回退默认(False)。
-    回归保护:旧 `bool(v)` 对非空字符串返回 True → 用户误写 "false" 静默跑成等权全池。"""
+def test_load_hold_all_strict_bool(monkeypatch):
+    """Q1/deepcode-4: _load_hold_all 只认 JSON bool,字符串 "false"/"0" 告警回退默认。
+    回归保护:旧 `bool(v)` 对非空字符串返回 True → 用户误写 "false" 静默跑成等权全池。
+    本地锁默认 HOLD_ALL=False(monkeypatch):唯有默认 False 时,"字符串→回退False" 与
+    "bool()旧bug→True" 才可区分,测试才有区分力(全局默认已改 True,故必须本地锁)。"""
     import json
+    monkeypatch.setattr(L, "HOLD_ALL", False)            # 锁 False 保区分力,与全局默认解耦
     cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_config.json")
     existed = os.path.exists(cfg)
     saved = open(cfg).read() if existed else None
     try:
-        for bad in ("false", "0", "true", "yes"):  # 字符串一律不应是 True
+        for bad in ("false", "0", "true", "yes"):  # 字符串一律回退默认、不应被 bool() 当 True
             with open(cfg, "w") as f:
                 json.dump({"hold_all": bad}, f)
             assert L._load_hold_all() is False, f"字符串 {bad!r} 应回退默认 False,非 True"

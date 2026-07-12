@@ -50,13 +50,14 @@ TOP_N = 3                              # 持有动量最高的前 N 只（等权
 CASH_BUFFER = 0.99                     # 目标仓位上限（留 1% 现金，吸收手续费/滑点）
 
 # ---- 部署模式:动量选股 vs 等权全池(J1/J2 结论落地)----
-# False(默认)= 动量轮动:按混合动量选 top_n + 绝对动量切防守(向后兼容)。
-# True = 等权全池+风控:跳过选股与绝对动量,等权持有全部有足够历史的候选标的,风控
+# True(默认)= 等权全池+风控:跳过选股与绝对动量,等权持有全部有足够历史的候选标的,风控
 #       (vol_target/趋势/崩溃/回撤)原样运行。J1(美股 23 年)+ J2(A 股)两市一致结论:
 #       动量选股无可靠 alpha(bootstrap P=0.148 / 0.560)、选股还略抬高回撤;等权全池版
-#       夏普≈选股版、回撤更浅、少一层过拟合风险。重稳健可切 True。实盘由 live
-#       读 live_config.json 的 "hold_all" 覆盖此默认(见 _load_hold_all)。
-HOLD_ALL = False
+#       夏普≈选股版、回撤更浅、少一层过拟合风险。2026-07-12 起默认改 True——对齐全实盘口径
+#       (live_config.json 已 hold_all=true),让回测默认输出与实盘行为一致。
+# False = 动量轮动:按混合动量选 top_n + 绝对动量切防守(诊断/对照用,见 engine nomomentum 子命令)。
+#       实盘由 live 读 live_config.json 的 "hold_all" 覆盖此默认(见 _load_hold_all)。
+HOLD_ALL = True
 VOL_TARGET = 0.15                      # 年化目标波动；组合近期波动超此值就降风险仓（None=关闭）
 VOL_WINDOW = 20                        # 估计近期波动的回看交易日
 COMMISSION = 0.00025                   # 单边手续费
@@ -93,7 +94,14 @@ CRASH_CUT = 0.5                           # 触发时股票仓保留比例（0.5
 # 波动率目标的盲区是"慢刀阴跌"（低波动但持续下跌，vol_target 不触发）。用大盘（风向标）
 # 距近 DD_WINDOW 日高点的累积跌幅捕捉：回撤 ≤ DD_THR 时降股票仓挪国债。与 trend filter
 # 同源（都用大盘）但信号不同——trend 看长期均线方向，drawdown 看累积跌幅深度。
-DRAWDOWN_PROT = False                     # 默认关（向后兼容）；改 True 开启
+#
+# 2026-07-12 起默认改 True（hold_all 实盘口径 A/B + 配对 block bootstrap n=2000、block=21）：
+#   开 vs 关 → 回撤 −16.9%→−12.4%（改善 4.5pp）、Calmar 0.68→0.93（+38%）、Sortino 1.42→1.52、
+#   波动 11.7%→11.1%、夏普 1.01→1.08（Δ+0.066，P=0.122 未达 5% 但本职回撤/Calmar 实质强）、
+#   年化 11.4%→11.5%（几乎不掉，避损不踏空）。口径切换不改结论（选股口径亦 P=0.112）。
+#   采纳理由：实盘 hold_all 目标函数是回撤/Calmar 而非夏普显著；夏普未达显著是深跌时段样本
+#   少的统计限制，非效果问题。详见 IMPROVEMENTS C2 条（2026-07-12 hold_all 口径重评,默认改开）。
+DRAWDOWN_PROT = True                      # 默认开（2026-07-12 改；hold_all 口径收益见上方注释）
 DD_WINDOW = 126                           # 回撤计算窗口（约半年）
 DD_THR = -0.10                            # 大盘距窗口高点跌幅 ≤ -10% 触发（深跌=慢刀阴跌累积）
 DD_CUT = 0.5                              # 触发时股票仓保留比例（0.5=砍半挪国债）
@@ -259,7 +267,7 @@ def decide_targets(recent_closes, lookbacks=LOOKBACKS, top_n=TOP_N,
                    crash_thr=CRASH_THR, crash_cut=CRASH_CUT,
                    drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
                    dd_thr=DD_THR, dd_cut=DD_CUT, defense_cash=None, max_weight=None,
-                   hold_all=False):
+                   hold_all=HOLD_ALL):
     """
     输入:
       recent_closes: {code: 收盘价序列}，按时间升序，最后一个是“当前”。

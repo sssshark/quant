@@ -27,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from cta import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N,
+from cta import (POOL, DEFENSE, BENCH, MAX_LOOKBACK, LOOKBACKS, TOP_N, HOLD_ALL,
                            VOL_TARGET, VOL_WINDOW, TREND_MA, TREND_CUT, TREND_CODE, SKIP_RECENT,
                            RISK_ADJ, LOOKBACK_WEIGHTS, COMMISSION, SLIPPAGE, WEIGHTING, INV_VOL_WINDOW,
                            CRASH_PROT, CRASH_LOOKBACK, CRASH_THR, CRASH_CUT,
@@ -352,7 +352,7 @@ def backtest(px, lookbacks=LOOKBACKS, top_n=TOP_N, vol_target=VOL_TARGET, trend_
              drawdown_prot=DRAWDOWN_PROT, dd_window=DD_WINDOW,
              dd_thr=DD_THR, dd_cut=DD_CUT,
              cant_buy=None, cant_sell=None, defense_cash=None, max_weight=None, return_turnover=False,
-             hold_all=False, strategy=None):
+             hold_all=HOLD_ALL, strategy=None):
     """月末调仓，权重由 decide_targets 决定。返回 (策略净值, 日收益, 调仓次数, 持仓日志)。
     成交口径（D1）：月末 T 日收盘算信号，次日（T+1）才成交——避免"收盘价信号 + 收盘价成交"
         的前视/乐观偏误。新权重自 T+2 起吃收益（shift(1) 自洽）。原 coc/当日收盘口径已被替换。
@@ -1722,50 +1722,51 @@ def main():
         run_multi(px, lim=dict(cant_buy=cant_buy, cant_sell=cant_sell))
         return
 
-    # 风控逐步叠加（等权）+ C1 反向波动加权对照，全部对比基准（real 模式带 D1/D2 新口径）
+    # 风控逐步叠加（hold_all 等权全池口径,2026-07-12 起默认）对比基准（real 模式带 D1/D2 新口径）。
+    # 注:hold_all=True 下 weighting（C1 反向波动）被忽略（始终等权）→ C1 对照失效,故改做 C2 对照。
     lim = dict(cant_buy=cant_buy, cant_sell=cant_sell)
-    nav_base, ret_base, _, _ = backtest(px, vol_target=None, **lim)
-    nav_vt, ret_vt, n_vt, _ = backtest(px, vol_target=VOL_TARGET, **lim)
-    nav_tr, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA, **lim)        # 等权（默认）
-    nav_iv, ret_iv, _, log = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA,
-                                      weighting="inv_vol", **lim)                               # C1 反向波动
+    nav_base, ret_base, _, _ = backtest(px, vol_target=None, trend_ma=None,
+                                        drawdown_prot=False, **lim)            # 等权全池(无风控)
+    nav_vt, ret_vt, n_vt, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=None,
+                                       drawdown_prot=False, **lim)             # +波动目标
+    nav_tr, ret_tr, _, _ = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA,
+                                    drawdown_prot=False, **lim)                # +大盘趋势过滤
+    nav_c2, ret_c2, _, log = backtest(px, vol_target=VOL_TARGET, trend_ma=TREND_MA,
+                                      drawdown_prot=True, **lim)               # +回撤控制C2(默认部署口径)
     bn = bench_nav(px)
 
     p_base, p_vt = perf(nav_base, ret_base), perf(nav_vt, ret_vt)
-    p_tr, p_iv = perf(nav_tr, ret_tr), perf(nav_iv, ret_iv)
+    p_tr, p_c2 = perf(nav_tr, ret_tr), perf(nav_c2, ret_c2)
     pb = perf(bn, bn.pct_change().fillna(0))
 
-    print(f"回测区间: {nav_tr.index[0].date()} ~ {nav_tr.index[-1].date()}  "
-          f"共{p_tr['年数']:.1f}年  调仓{n_vt}次  （真实数据）\n")
+    print(f"回测区间: {nav_c2.index[0].date()} ~ {nav_c2.index[-1].date()}  "
+          f"共{p_c2['年数']:.1f}年  调仓{n_vt}次  （真实数据,hold_all+C2 默认口径）\n")
     _print_table([
-        ("改进版(无回撤控制)", p_base),
-        (f"改进版+波动目标{int(VOL_TARGET*100)}%", p_vt),
-        (f"+大盘趋势过滤{TREND_MA}日(等权)", p_tr),
-        (f"+大盘趋势过滤(反向波动C1)", p_iv),
+        ("等权全池(无风控)", p_base),
+        (f"+波动目标{int(VOL_TARGET*100)}%", p_vt),
+        (f"+大盘趋势过滤{TREND_MA}日", p_tr),
+        ("+回撤控制C2(默认部署)", p_c2),
         ("买入持有沪深300", pb),
     ])
-    print(f"\n[C1 反向波动 vs 等权] 夏普 {p_tr['夏普']:.2f}→{p_iv['夏普']:.2f} "
-          f"({p_iv['夏普']-p_tr['夏普']:+.2f})  年化 {p_tr['年化']*100:.1f}%→{p_iv['年化']*100:.1f}% "
-          f"({(p_iv['年化']-p_tr['年化'])*100:+.1f}pp)  回撤 {p_tr['回撤']*100:.1f}%→{p_iv['回撤']*100:.1f}%")
+    print(f"\n[C2 回撤控制 开vs关] 夏普 {p_tr['夏普']:.2f}→{p_c2['夏普']:.2f} "
+          f"({p_c2['夏普']-p_tr['夏普']:+.2f})  年化 {p_tr['年化']*100:.1f}%→{p_c2['年化']*100:.1f}% "
+          f"({(p_c2['年化']-p_tr['年化'])*100:+.1f}pp)  回撤 {p_tr['回撤']*100:.1f}%→{p_c2['回撤']*100:.1f}%  "
+          f"Calmar {p_tr['Calmar']:.2f}→{p_c2['Calmar']:.2f}")
     if log:
         print(f"最近一次调仓 {log[-1][0]}: {log[-1][1]}")
 
-    # 画图：净值 / 水下曲线 / 滚动夏普 三子图（F2 滚动指标）
-    rs_tr, _, dd_tr = rolling_metrics(ret_tr)
-    rs_iv, _, dd_iv = rolling_metrics(ret_iv)
+    # 画图：净值 / 水下曲线 / 滚动夏普 三子图（F2 滚动指标）—— hold_all+C2 默认口径 vs 基准
+    rs_c2, _, dd_c2 = rolling_metrics(ret_c2)
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True,
                              gridspec_kw={"height_ratios": [3, 1, 1]})
-    axes[0].plot(nav_tr.index, nav_tr.values, label="等权 + TrendFilt", lw=1.8, color="#1f4e79")
-    axes[0].plot(nav_iv.index, nav_iv.values, label="反向波动 + TrendFilt (C1)", lw=1.8, color="#2e7d32")
+    axes[0].plot(nav_c2.index, nav_c2.values, label="hold_all + 风控(vol+trend+C2)", lw=1.8, color="#1f4e79")
     axes[0].plot(bn.index, bn.values, label="Buy & Hold CSI300", lw=1.1, color="#c0504d", alpha=0.8)
     axes[0].set_yscale("log"); axes[0].set_ylabel("Net Value (log)")
     axes[0].legend(loc="upper left"); axes[0].grid(alpha=0.3)
-    axes[0].set_title("A-share ETF Momentum Rotation [REAL] — C1 反向波动加权 vs 等权")
-    axes[1].fill_between(dd_tr.index, dd_tr.values * 100, 0, color="#1f4e79", alpha=0.25, label="等权")
-    axes[1].plot(dd_iv.index, dd_iv.values * 100, color="#2e7d32", lw=1.0, label="反向波动")
+    axes[0].set_title("A-share ETF 等权全池+风控 [REAL] — hold_all 默认口径 vs 基准")
+    axes[1].fill_between(dd_c2.index, dd_c2.values * 100, 0, color="#1f4e79", alpha=0.25, label="策略")
     axes[1].set_ylabel("Drawdown %"); axes[1].legend(loc="lower left"); axes[1].grid(alpha=0.3)
-    axes[2].plot(rs_tr.index, rs_tr.values, color="#1f4e79", lw=1.0, label="等权")
-    axes[2].plot(rs_iv.index, rs_iv.values, color="#2e7d32", lw=1.0, label="反向波动")
+    axes[2].plot(rs_c2.index, rs_c2.values, color="#1f4e79", lw=1.0, label="策略")
     axes[2].axhline(0, color="k", lw=0.5)
     axes[2].set_ylabel("Rolling Sharpe (1y)"); axes[2].legend(loc="upper left"); axes[2].grid(alpha=0.3)
     fig.tight_layout()
@@ -1774,15 +1775,13 @@ def main():
     print("\n图已保存:", out)
 
     print("\n[F2 滚动指标(1年窗口)摘要]")
-    for name, rs in (("等权", rs_tr), ("反向波动", rs_iv)):
-        rs = rs.dropna()
-        if len(rs):
-            print(f"  {name}: 滚动夏普 均值{rs.mean():.2f} / 最差{rs.min():.2f} / "
-                  f"占比>0 {(rs > 0).mean() * 100:.0f}%")
+    rs = rs_c2.dropna()
+    if len(rs):
+        print(f"  策略: 滚动夏普 均值{rs.mean():.2f} / 最差{rs.min():.2f} / "
+              f"占比>0 {(rs > 0).mean() * 100:.0f}%")
 
     # F3 分 regime（牛/熊/震荡）拆解：看策略在哪种行情有效、是否跑赢基准
-    run_regime(px, ret_tr, "等权+趋势")
-    run_regime(px, ret_iv, "反向波动+趋势")
+    run_regime(px, ret_c2, "hold_all+风控(默认)")
 
 
 if __name__ == "__main__":
