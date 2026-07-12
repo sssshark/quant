@@ -102,21 +102,44 @@ def _load_hold_all():
 # ---------------- 1) 行情：最近 N 日收盘 ----------------
 def get_recent_closes(codes, n):
     """
-    用 akshare 取最近 n 个交易日收盘价（独立可用，便于离线核对计划）。
-    实盘可改用 xtdata.get_market_data_ex 直接从 QMT 取，少一个数据源依赖。
+    取每只最近 n+1 根前复权收盘（够算 n 日动量 + 200 日趋势均线）。
+    优先 tushare：复用 engine.load_real（主力源、含 relay 关键标的兜底、且与回测同源
+    消除"实盘东财/回测 tushare"的复权口径漂移）；tushare 缺标或失败时回退 akshare 东财。
+    实盘接通 QMT 后可改 xtdata.get_market_data_ex 直接从 QMT 取，少一个数据源依赖。
     """
+    # 优先 tushare：复用 engine 全量前复权加载，取每只尾部 n+1 根
+    try:
+        import engine as e
+        loaded = e.load_real(with_limits=False)
+        px = loaded[0] if isinstance(loaded, tuple) else loaded
+        out = {}
+        for c in codes:
+            if c in px.columns:
+                vals = px[c].dropna().tolist()
+                if len(vals) >= 2:
+                    out[c] = vals[-(n + 1):]
+        miss = [c for c in codes if c not in out]
+        if not miss:
+            return out                                  # tushare 全取到 → 用它（与回测同源）
+        print(f"[live] tushare 缺 {miss}，akshare 补")
+    except Exception as exc:
+        print(f"[live] tushare 加载失败（{type(exc).__name__}: {exc}），回退 akshare 东财")
+        out = {}
+    # akshare 回退（东财可达时；东财不可达会逐标的抛并跳过）
     import akshare as ak
-    # 往前多取些日历日：要 n 个“交易日”，但日历日里有周末/节假日，所以 ×3 再加余量，
-    # 保证截取后够 n+1 个交易日收盘价。strftime("%Y%m%d") 把日期转成 akshare 要的 "20260628" 格式。
+    # 往前多取日历日：要 n 个"交易日"，周末/节假日占位，×3+余量保证截后够 n+1 根
     start = (dt.date.today() - dt.timedelta(days=n * 3 + 30)).strftime("%Y%m%d")
     end = dt.date.today().strftime("%Y%m%d")
-    out = {}
     for c in codes:
-        df = ak.fund_etf_hist_em(symbol=c, period="daily",
-                                 start_date=start, end_date=end, adjust="qfq")
-        if len(df):
-            # 取收盘列→转float→转列表，再用 [-(n+1):] 取最后 n+1 个（够算 n 日动量）
-            out[c] = df["收盘"].astype(float).tolist()[-(n + 1):]
+        if c in out:
+            continue
+        try:
+            df = ak.fund_etf_hist_em(symbol=c, period="daily",
+                                     start_date=start, end_date=end, adjust="qfq")
+            if len(df):
+                out[c] = df["收盘"].astype(float).tolist()[-(n + 1):]
+        except Exception as exc:
+            print(f"[live] {c} akshare 也失败：{exc}")
     return out
 
 

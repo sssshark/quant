@@ -49,6 +49,8 @@
 > ⚠ **数据源漂移(2026-07-11)**：数据源切换使 CTA 夏普 1.20→1.19 末位漂移、年化 15.1%→15.0%；正文仍标 1.20/1.198 系 pre_close 版口径，实盘当前值见 README 1.19/15.0%。相对比较(如 1.20→0.94 扩池)内部自洽不受影响。
 >
 > 🔧 **relay 鲁棒性加固(2026-07-12)**：tushare 代理(47.116.63.181)间歇抽风时，`BENCH`(510300)/`DEFENSE[0]`(511010) 的 `fund_daily` 4 次重试皆败会被 E6 跳过 → `_anchor_start` 取 `px[[BENCH, DEFENSE[0]]]` 时 KeyError 崩盘（实盘调仓日 relay 抽风即此症，回测也两次踩中）。修复：`_load_via_tushare` 拉完检测关键锚定标的缺失 → 抽 `_eastmoney_qfq_series`/`_fill_critical_via_eastmoney`（东财单标的 helper，`_load_via_eastmoney` 同时复用 DRY）仅补这 ≤2 个（非全量降级、口径切换限定在锚定/防守标的、非选股标的，影响极小），补完仍缺才返回 None 走全量东财。**修复前崩盘、修复后 loud warning + 东财兜底继续跑**，是 live.py 实盘调仓的硬阻塞解除。单测 3 条（helper 成功/重试失败/兜底纯函数）+ 端到端冒烟（monkeypatch 511010 relay 失败→东财补齐→px 含该列不崩）。
+>
+> 🚀 **实盘演练口径统一 + live 数据源同源(2026-07-12,P0-1)**：live_config.json 设 hold_all=true(等权全池+风控,J1/J2/J5/G3 验证的稳健实盘口径,非选股),paper 模式 force 跑通完整月末调仓闭环(建仓→8 笔先卖后买→模拟成交→调仓后对账偏离 0.7%<10%);目标权重 7 只风险资产各 10.2% + 国债 27.4%(趋势下行挪防守)。**同源修复 live.py get_recent_closes**:原写死 akshare 东财,在东财不可达网络(本机代理 7897 对 push2his.eastmoney.com 不通)必败;改优先复用 engine.load_real(tushare 主力源,含 relay 兜底、**与回测同源消除"实盘东财/回测 tushare"复权口径漂移**),akshare 降为回退。至此 P0-1(实盘口径)+ relay 兜底(P0-2)均落地;P0-3(ETF 折溢价建模 J7)待办。
 
 ---
 
