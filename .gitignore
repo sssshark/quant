@@ -2,8 +2,8 @@
 __pycache__/
 *.pyc
 
-# Claude 本地配置（含机器相关的本地设置，不入仓库）
-.claude/settings.local.json
+# Claude 本地状态（agents/skills/memory/设置，机器相关且含会话状态，不入仓库）
+.claude/
 
 # 运行时状态（实盘/模拟盘账户与调仓记录，随运行变化，不入仓库）
 paper_account.json
@@ -11,6 +11,10 @@ last_rebalance.txt
 
 # 回测产出的图（可由 engine.py / bt_recent.py 重新生成；engine 全周期 + bt_recent 近 N 年窗口）
 ETF动量轮动_*.png
+exp_vol_target.png
+
+# LibreOffice 编辑锁文件（临时文件，不入仓库）
+.~lock.*
 
 # tushare 凭证（本地持有，不入仓库；_load_via_tushare 在环境变量缺失时回退读它）
 .tushare_token
