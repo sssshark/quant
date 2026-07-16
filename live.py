@@ -25,6 +25,7 @@
 import os
 import sys
 import json
+import time
 import datetime as dt
 
 from cta import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
@@ -34,8 +35,12 @@ from cta import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
 HISTORY_BARS = max(MAX_LOOKBACK, TREND_MA)
 
 # ---------------- 你需要改的配置 ----------------
-BROKER = "paper"                                 # "paper"=本地模拟账户跑通；"qmt"=接华泰 miniQMT
-DRY_RUN = True                                   # 仅对 qmt 生效：True=只打印不下单；paper 始终模拟成交
+BROKER = "qmt"                                   # "paper"=本地模拟账户跑通；"qmt"=接华泰 miniQMT
+DRY_RUN = False                                  # 仅对 qmt 生效：True=只打印不下单；paper 始终模拟成交
+EQUITY_CAP = 30_000.0                             # 策略可用资金上限（None=用账户实际总资产）。设了之后，
+                                                  # 即使账户有 100 万，策略按 2 万 × 权重分配，其余资金不动。
+                                                  # 用途：实盘小资金测试、子账户隔离。注意：read_account 仍读真实持仓，
+                                                  # 所以"账户持仓 > cap×权重"时仍会卖出多余部分。
 LOT = 100                                        # ETF 最小交易单位（股）
 REBALANCE_BAND = 0.05                             # 再平衡静默区：偏离<5%总资产的小漂移不调仓
 RECONCILE_THR = 0.10                              # H1 对账阈值：偏离>10%总资产告警（>band，避免整手/静默区固有偏离误报）
@@ -174,16 +179,25 @@ def connect_trader():
 
 
 def read_account(ctx, price):
-    """返回 (总资产, {code: 持仓股数})。"""
+    """返回 (总资产, {code: 持仓股数})。
+
+    若设了 EQUITY_CAP，返回的总资产 = min(账户实际总资产, EQUITY_CAP)。
+    持仓仍读真实值——这样 build_orders 算"目标 - 现持"差额时，能正确卖出超额仓位。
+    """
     if ctx is None:
         return DEMO_TOTAL, {}
     kind, h = ctx
     if kind == "paper":
         h.set_prices(price)
-        return h.total_asset(), h.positions()
-    trader, acc = h
-    asset = trader.query_stock_asset(acc)
-    total = asset.total_asset if asset else DEMO_TOTAL
+        total = h.total_asset()
+    else:
+        trader, acc = h
+        asset = trader.query_stock_asset(acc)
+        total = asset.total_asset if asset else DEMO_TOTAL
+    if EQUITY_CAP and total > EQUITY_CAP:
+        total = EQUITY_CAP
+    if kind == "paper":
+        return total, h.positions()
     positions = {}
     for p in trader.query_stock_positions(acc) or []:
         positions[p.stock_code.split(".")[0]] = p.volume
@@ -433,17 +447,29 @@ def main():
 
     for code, side, shares in orders:
         place(ctx, code, side, shares)
-    mark_done_this_month()
 
     if kind == "paper":
+        mark_done_this_month()                                 # paper 同步模拟成交，必达成
         total2, pos2 = read_account(ctx, price)
         print(f"\n[paper] 已模拟成交。期末总资产: {total2:,.0f}  持仓: {pos2}")
         reconcile(target, pos2, total2, price, when="调仓后")   # H1：调仓后对账（paper 全成交，应≈一致）
         print(f"账户状态已保存到 {os.path.basename(PAPER_STATE)}（下次运行会接着用）。")
     else:
+        # qmt：place 是异步委托，要等几秒让服务端撮合，再读真实持仓算偏离。
+        # 偏离 < 阈值 = 实际达成目标 → 写月度标记；否则不写，下次运行会按"目标-当前持仓"
+        # 差额自动补单。这避免了"place 都发了就误标记为完成"的设计 bug。
+        print("\n[等 5 秒] 给 QMT 服务端撮合时间...")
+        time.sleep(5)
         total2, pos2 = read_account(ctx, price)
-        reconcile(target, pos2, total2, price, when="调仓后")   # H1：调仓后对账（qmt 订单在途可能偏离，超阈需核对成交）
-        print("\n已提交全部订单。请到 QMT 客户端核对成交。")
+        max_diff = reconcile(target, pos2, total2, price, when="调仓后")
+        if max_diff < RECONCILE_THR:
+            mark_done_this_month()
+            print(f"偏离 {max_diff*100:.1f}% < 阈值 {RECONCILE_THR*100:.0f}%，标记本月已完成。")
+        else:
+            print(f"\n[警告] 偏离 {max_diff*100:.1f}% ≥ 阈值 {RECONCILE_THR*100:.0f}%，有单未完整成交。")
+            print("不写月度标记 → 下次运行会自动算差额补单。")
+            print("如确认本次不补，请手工核对 QMT 客户端「交易」面板后用 force 参数强制重跑。")
+        print("请到 QMT 客户端「交易」面板核对成交明细。")
 
 
 if __name__ == "__main__":
