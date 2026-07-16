@@ -28,6 +28,13 @@ import json
 import time
 import datetime as dt
 
+# Windows 系统代理（Clash 等）会把本进程 HTTP 请求路由到代理出口，对 tushare-relay
+# 这种 http 明文中转不友好，也叠加东财风控。patch getproxies 让本进程内 requests 直连，
+# 不影响 xtquant（它是本地 IPC 不是 HTTP）。注：这只能消除"代理"这一层——东财对直连
+# 也会 RST（实测 akshare 直连仍被风控），故 akshare 仅作兜底，主力仍是 tushare relay。
+import urllib.request
+urllib.request.getproxies = lambda: {}
+
 from cta import (POOL, DEFENSE, MAX_LOOKBACK, COMMISSION, SLIPPAGE,
                            TREND_MA, HOLD_ALL, _limit, decide_targets)
 
