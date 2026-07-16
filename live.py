@@ -28,10 +28,9 @@ import json
 import time
 import datetime as dt
 
-# Windows 系统代理（Clash 等）会把本进程 HTTP 请求路由到代理出口，对 tushare-relay
-# 这种 http 明文中转不友好，也叠加东财风控。patch getproxies 让本进程内 requests 直连，
-# 不影响 xtquant（它是本地 IPC 不是 HTTP）。注：这只能消除"代理"这一层——东财对直连
-# 也会 RST（实测 akshare 直连仍被风控），故 akshare 仅作兜底，主力仍是 tushare relay。
+# Windows 系统代理（Clash 等）会把 akshare/tushare-relay 的 HTTP 请求路由到代理出口，
+# 触发东财风控主动 RST（Remote end closed connection）。patch getproxies 让本进程内所有
+# requests 直连，不影响 xtquant（它是 IPC 不是 HTTP）。
 import urllib.request
 urllib.request.getproxies = lambda: {}
 
@@ -43,7 +42,7 @@ HISTORY_BARS = max(MAX_LOOKBACK, TREND_MA)
 
 # ---------------- 你需要改的配置 ----------------
 BROKER = "qmt"                                   # "paper"=本地模拟账户跑通；"qmt"=接华泰 miniQMT
-DRY_RUN = False                                  # 仅对 qmt 生效：True=只打印不下单；paper 始终模拟成交
+DRY_RUN = True                                   # 仅对 qmt 生效：True=只打印不下单；paper 始终模拟成交
 EQUITY_CAP = 30_000.0                             # 策略可用资金上限（None=用账户实际总资产）。设了之后，
                                                   # 即使账户有 100 万，策略按 2 万 × 权重分配，其余资金不动。
                                                   # 用途：实盘小资金测试、子账户隔离。注意：read_account 仍读真实持仓，
@@ -222,7 +221,44 @@ def _market(code):
     return code + (".SH" if code[0] in ("5", "6") else ".SZ")
 
 
-def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
+def _qmt_realtime_prices(codes, fallback=None):
+    """从 QMT 取各标的「现价」（用于算下单股数/对账），与信号价分源——互不污染。
+
+    设计要点（为什么单独取、不复用 recent[-1]）：
+      - decide_targets 算动量/200日均线用的是 tushare【前复权历史序列】（复权正确、
+        且与回测同源，口径不能动）。
+      - 但下单股数 = 目标市值 / 现价。若现价也用 recent[-1]（tushare 最新收盘），
+        盘中下单时它是【昨日】收盘，与 QMT 实际成交价（盘中实时）差出当日日内波动。
+      - 故现价改问 QMT 要实时最新价（xtdata tick），信号历史序列仍走 tushare——
+        两条价格各管一段，互不污染。
+      - _qfq_from_pre_close 的数学性质保证「前复权最新价 == 未复权真实最新收盘」，
+        所以收盘后两者同价、盘中 xtdata 才显出实时优势。
+      - 取不到（QMT 未连/该标的无 tick）→ 回退 fallback[code]（=tushare 收盘），
+        宁可用昨收也不阻塞下单；空 dict 不会发生在 QMT 接通时。
+    """
+    out = {}
+    try:
+        from xtquant import xtdata
+    except ImportError:
+        return dict(fallback or {})
+    for c in codes:
+        try:
+            code = _market(c)
+            # tick 取最新成交价；xtdata 若无该标的实时快照返回空，逐标的容错。
+            snap = xtdata.get_full_tick([code])
+            if code in snap and snap[code].get("lastPrice"):
+                out[c] = float(snap[code]["lastPrice"])
+        except Exception:
+            pass
+    # 缺的标的用 tushare 收盘兜底，保证每个要下单的 code 都有价
+    if fallback:
+        for c, p in fallback.items():
+            if c not in out and p:
+                out[c] = p
+    return out
+
+
+def build_orders(target, price, total, positions, band=REBALANCE_BAND,
                  cant_buy_today=None, cant_sell_today=None):
     """
     对比目标权重与当前持仓，生成 [(code, 'BUY'/'SELL', 股数), ...]，先卖后买。
@@ -230,10 +266,11 @@ def build_orders(target, recent, total, positions, band=REBALANCE_BAND,
     不足 band×总资产就不动，避免无谓换手；换信号（清仓/新建仓）照常执行。
     D2：cant_buy_today/cant_sell_today 是当日收盘封涨停/跌停的 code 集合——封板方向
     无法成交（券商本也会拒单），直接跳过该单、维持原仓，省无效挂单。
+    价格分源：price 是【下单现价】（main 里走 _qmt_realtime_prices 实时价，tushare 收盘兜底），
+    与 decide_targets 用的 tushare 前复权历史序列分源——信号/下单各管一段，互不污染。
     """
     cant_buy_today = cant_buy_today or set()
     cant_sell_today = cant_sell_today or set()
-    price = {c: arr[-1] for c, arr in recent.items()}   # 各标的现价 = 序列最后一个收盘
     # 目标股数 = 目标市值 / 现价，再四舍五入到整百股（D5：替代原向下取整，避免长期欠仓累积；
     #   cash_buffer=0.99 留 1% 现金兜底四舍五入的小幅超买）。
     # 写法解析：total*w/px 是理论股数；/LOT 得“多少个100股”；+0.5 再 int 实现四舍五入（五入）。
@@ -400,7 +437,20 @@ def main():
 
     codes = list(POOL) + [DEFENSE[0]]
     recent = get_recent_closes(codes, HISTORY_BARS)   # 取够 200 根，趋势过滤才不会静默失效
-    price = {c: arr[-1] for c, arr in recent.items()}
+    # 信号价：recent（tushare 前复权历史，喂 decide_targets）；现价：另问 QMT 取实时。
+    # 两条价格分源——recent 只算信号/涨跌停环比，price 只算下单股数/对账，互不污染。
+    ts_close = {c: arr[-1] for c, arr in recent.items()}           # tushare 最新收盘（兜底用）
+    price = _qmt_realtime_prices(codes, fallback=ts_close) if BROKER == "qmt" else dict(ts_close)
+
+    # 价格分源透明度：QMT 实时现价 vs tushare 最新收盘。收盘后应≈0；盘中才有日内差。
+    if BROKER == "qmt":
+        diffs = {c: (price[c] - ts_close[c]) / ts_close[c] * 100
+                 for c in ts_close if c in price and ts_close[c]}
+        drift = [f"{c}{d:+.2f}%" for c, d in diffs.items() if abs(d) >= 0.05]
+        if drift:
+            print(f"[价格分源] QMT实时 vs tushare收盘 偏差≥0.05%: {drift}")
+        else:
+            print(f"[价格分源] QMT实时 ≈ tushare收盘（差异均<0.05%，收盘后/同源正常）")
 
     hold_all = _load_hold_all()
     mode_name = "等权全池+风控(不选股,J1/J2 稳健版)" if hold_all else "动量轮动(top3+绝对动量)"
@@ -435,7 +485,7 @@ def main():
     print(f"账户总资产: {total:,.0f}  当前持仓: {positions or '无'}")
     reconcile(target, positions, total, price, when="调仓前")   # H1：调仓前先对账（抓跨月漂移/上次未完整执行）
 
-    orders = build_orders(target, recent, total, positions,
+    orders = build_orders(target, price, total, positions,
                           cant_buy_today=cant_buy_today, cant_sell_today=cant_sell_today)
     if not orders:
         print("已与目标一致，无需调仓。")
