@@ -311,17 +311,30 @@ def build_orders(target, price, total, positions, band=REBALANCE_BAND,
                            for c in set(positions) | set(want))
         for code, side, sh in sells:                     # 卖单回笼（扣滑点近似）
             cash += sh * price.get(code, 0.0) * (1 - SLIPPAGE)
-        capped = []
+        # 现金兜底顺序：按目标市值降序（大额优先配）。⚠ 旧版直接遍历 buys（来自无序 set），
+        # 现金不足时"哪只被截"取决于 set 随机迭代顺序 + 当下价格 → dry-run 通过不代表真单
+        # 通过（实盘踩过：510300 在 dry-run 下了 100 股，真单同逻辑却因 set 顺序不同被截到 0，
+        # 且无任何告警，直接从调仓计划消失）。改确定性降序：核心大标的（国债）先保、小标的
+        # 兜底，且结果可复现——dry-run 看到的截断即真单会发生的截断。
+        buys.sort(key=lambda x: x[2] * price.get(x[0], 0.0), reverse=True)
+        capped, skipped = [], []
         for code, side, sh in buys:
             px = price.get(code, 0.0)
             if px <= 0:
                 continue
             affordable = int(cash / (px * (1 + SLIPPAGE) * LOT)) * LOT   # 含滑点的可买整百
-            sh = min(sh, affordable)
-            cash -= sh * px * (1 + SLIPPAGE)            # 扣减已用现金
-            if sh > 0:
-                capped.append((code, side, sh))
+            actual = min(sh, affordable)
+            cash -= actual * px * (1 + SLIPPAGE)         # 扣减已用现金
+            if actual > 0:
+                capped.append((code, side, actual))
+            if actual < sh:                              # 现金不够，被截断
+                skipped.append((code, sh, actual))
         buys = capped
+        # 显式告警被截断的标的——旧版它们静默消失、无提示，不对比目标权重根本发现不了。
+        if skipped:
+            print("[现金兜底] 以下买单因可用现金不足被截断（小资金整手约束，非 bug）：")
+            for code, want_sh, actual_sh in skipped:
+                print(f"    {code} {_label(code)}: 目标 {want_sh} 股 → 实际下单 {actual_sh} 股")
     return sells + buys                     # 列表相加 = 先卖单后买单，保证先回笼现金
 
 
@@ -336,6 +349,45 @@ def place(ctx, code, side, shares):
     direction = xtconstant.STOCK_BUY if side == "BUY" else xtconstant.STOCK_SELL
     trader.order_stock(acc, _market(code), direction, shares,
                        xtconstant.LATEST_PRICE, 0, "动量轮动", "")
+
+
+def wait_fills(ctx, orders, timeout=30):
+    """轮询 QMT 委托成交回报，等本次 orders 全部成交或超时。仅 qmt 实盘。
+    替代旧版固定 sleep(5)：成交回报（尤其国债等大单）到账常 >5s，旧版 sleep 后读持仓会
+    误判"未成交"→ 对账假性偏离（实盘踩过：国债已成交却报偏离 56%、误判本月未完成）。
+    改轮询 traded_volume 达到委托量才认定成交，彻底消除该时序误判。
+    """
+    kind, h = ctx
+    if kind != "qmt":
+        return
+    trader, acc = h
+    expected = {}                                         # {code: 本次预期成交总量}
+    for code, side, sh in orders:
+        expected[code] = expected.get(code, 0) + sh
+    if not expected:
+        return
+    run_t = int(time.time()) - 10                         # 下单时刻附近，留余量应对时钟偏差
+    deadline = time.time() + timeout
+    filled = {}
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            qs = trader.query_stock_orders(acc) or []
+        except Exception:
+            continue
+        filled = {}
+        for o in qs:
+            # 只累计本次"动量轮动"策略、本次运行后提交的委托（排除历史委托干扰）
+            if getattr(o, "strategy_name", "") == "动量轮动" and o.order_time >= run_t:
+                c = o.stock_code.split(".")[0]
+                filled[c] = filled.get(c, 0) + o.traded_volume
+        if all(filled.get(c, 0) >= v for c, v in expected.items()):
+            print(f"[成交确认] 全部委托已成交（{timeout}s 内）：{ {c: filled[c] for c in expected} }")
+            return
+    missing = {c: (expected[c], filled.get(c, 0)) for c in expected if filled.get(c, 0) < expected[c]}
+    print(f"[成交确认] 等待 {timeout}s 后仍有未完整成交：")
+    for c, (want_v, got_v) in missing.items():
+        print(f"    {c} {_label(c)}: 委托 {want_v} 股，已成交 {got_v} 股")
 
 
 # ---------------- 主流程 ----------------
@@ -512,11 +564,12 @@ def main():
         reconcile(target, pos2, total2, price, when="调仓后")   # H1：调仓后对账（paper 全成交，应≈一致）
         print(f"账户状态已保存到 {os.path.basename(PAPER_STATE)}（下次运行会接着用）。")
     else:
-        # qmt：place 是异步委托，要等几秒让服务端撮合，再读真实持仓算偏离。
-        # 偏离 < 阈值 = 实际达成目标 → 写月度标记；否则不写，下次运行会按"目标-当前持仓"
-        # 差额自动补单。这避免了"place 都发了就误标记为完成"的设计 bug。
-        print("\n[等 5 秒] 给 QMT 服务端撮合时间...")
-        time.sleep(5)
+        # qmt：place 是异步委托，成交回报到账有延迟。旧版固定 sleep(5) 不够（国债等大单
+        # 常 >5s），sleep 后读持仓会误判"未成交"→ 对账假性偏离（实盘踩过：国债已成交却
+        # 报偏离 56%）。改 wait_fills 轮询 traded_volume 确认成交后再对账。偏离 < 阈值 =
+        # 达成目标 → 写月度标记；否则不写，下次按"目标-当前持仓"差额自动补单。
+        print("\n[等待成交] 轮询 QMT 委托成交回报（替代固定 sleep）...")
+        wait_fills(ctx, orders, timeout=30)
         total2, pos2 = read_account(ctx, price)
         max_diff = reconcile(target, pos2, total2, price, when="调仓后")
         if max_diff < RECONCILE_THR:
